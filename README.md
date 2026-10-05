@@ -208,6 +208,25 @@ Lumina-Engine-cli.exe -m model.gguf.lumina -p "The capital of France is" -n 16
 
 ---
 
+## Vulkan 后端与自动设备策略
+
+交付包含 `ggml-vulkan.dll`（本机 Intel Iris Xe 已实测）。**一套预编译版本，程序自动决定 CPU/GPU**，
+用户无需选择（显式 `-ngl` 始终优先）：
+
+| 机器/模型 | 自动策略 |
+|---|---|
+| 无 GPU | 纯 CPU |
+| 集成显卡（IGPU）+ dense 模型 | 层留 CPU + Vulkan 算子 offload（pp ≈2.4×） |
+| 集成显卡 + **MoE 模型** | 纯 CPU（MoE 走算子 offload 反而慢 ~30%） |
+| 独立显卡（dGPU） | 按显存 offload 整层 |
+
+- 想强制某一行为：`-ngl 99`（整层 offload）、`-ngl 0`（层留 CPU）、`--no-op-offload`（纯 CPU，逐位确定）。
+- 构建时若存在 `D:\VulkanSDK\sdk` 则自动启用 Vulkan；未安装 SDK 时自动回退 CPU-only。
+- **训练默认强制纯 CPU**（反向算子仅 CPU 实现）；`LUMINA_TRAIN_ALLOW_GPU=1` 为实验开关，不推荐。
+- 完整 A/B 数据见 **[OPTIMIZATION_LOG.md](OPTIMIZATION_LOG.md)**。
+
+---
+
 ## 训练引擎（QLoRA 微调量化模型）
 
 新增纯 C++ 训练工具 **`Lumina-Engine-train`**，用于微调 **Q4_K / Q8_0 / Q1_0 等量化模型**
@@ -276,7 +295,13 @@ Lumina-Engine-cli.exe -m model.Q4_K_M.gguf --lora model.lora.gguf -p "..." -n 12
 | `ggml/src/ggml.c` | 修改 | 新增 MoE `MUL_MAT_ID` 反向、`REGLU`/`SIGMOID`/`TANH`/`CLAMP` 反向、broadcast `DIV` 反向、批量 `GET_ROWS_BACK` |
 | `ggml/src/ggml-cpu/ggml-cpu.c` / `ops.cpp` | 修改 | 新反向算子的 CPU 内核（含量化专家权重的梯度） |
 | `ggml/include/ggml.h` / `ggml-rpc.h` | 修改 | 新增 `GGML_OP_MUL_MAT_ID_BACK_AS/_B` 算子与 RPC 版本 |
-| `common/build-info.cpp.in` / `CMakeLists.txt` | 修改 | 版本号升至 **Build 11** |
+| `common/build-info.cpp.in` / `CMakeLists.txt` | 修改 | 版本号升至 **Build 16** |
+| `configure-release.bat` | 修改 | 检测 `D:\VulkanSDK\sdk` 并启用 `GGML_VULKAN`（无 SDK 自动回退） |
+| `common/common.h` / `common/arg.cpp` | 修改 | `-ngl` 默认 `auto` → `0`（层留 CPU + Vulkan 算子 offload）；移除旧断言 |
+| `common/common.cpp` | 修改 | **机器+模型感知的自动设备策略**：IGPU→层留 CPU、dGPU→offload、MoE→关闭算子 offload |
+| `ggml/src/ggml-vulkan/ggml-vulkan.cpp` | 修改 | 修复 `COUNT_EQUAL` 的 I32/I64 类型不匹配（GPU 训练 acc 损坏） |
+| `common/build-info.*` / `tools/cli` / `tools/server` | 修改 | 控制台横幅显示 Build 号 + 项目链接（GitHub / 爱发电 / Bilibili） |
+| `tools/lumina-train/` | 修改 | 训练强制纯 CPU（`no_op_offload`），修复 Vulkan 污染训练指标 |
 
 完整改动说明见 [wiki/Changes.md](wiki/Changes.md)。
 

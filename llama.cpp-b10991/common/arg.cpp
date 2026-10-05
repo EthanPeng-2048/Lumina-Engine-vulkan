@@ -2780,10 +2780,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
-    GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
+    // Lumina-Engine: the default is 0 (CPU layers + Vulkan op-offload), which keeps the
+    // pre-Vulkan behaviour while still letting the GPU accelerate individual ops. Users can
+    // pass '-ngl auto' or '-ngl all' to offload whole layers to the GPU.
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
-        string_format("max. number of layers to store in VRAM, either an exact number, 'auto', or 'all' (default: %s)", params.n_gpu_layers == -1 ? "auto" : "all"),
+        string_format("max. number of layers to store in VRAM, either an exact number, 'auto', or 'all' (default: %s)", params.n_gpu_layers == -1 ? "auto" : (params.n_gpu_layers == 0 ? "0 (CPU + op-offload)" : "all")),
         [](common_params & params, const std::string & value) {
             if (value == "auto") {
                 params.n_gpu_layers = -1;
@@ -2792,6 +2794,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else {
                 params.n_gpu_layers = std::stoi(value);
             }
+            params.n_gpu_layers_set = true;
             if (!llama_supports_gpu_offload()) {
                 fprintf(stderr, "warning: no usable GPU found, --gpu-layers option will be ignored\n");
                 fprintf(stderr, "warning: one possible reason is that llama.cpp was compiled without GPU support\n");
@@ -2945,6 +2948,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("whether to offload host tensor operations to device (default: %s)", params.no_op_offload ? "false" : "true"),
         [](common_params & params, bool value) {
             params.no_op_offload = !value;
+            params.no_op_offload_set = true;
         }
     ));
     add_opt(common_arg(

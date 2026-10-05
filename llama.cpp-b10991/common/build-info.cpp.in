@@ -26,10 +26,30 @@ const char * llama_build_target(void) {
 
 const char * llama_build_info(void) {
     // Lumina-Engine build identity (kept independent of the upstream git commit count).
-    return "Build 11 (Based on llama.cpp b-10991)";
+    return "Build 16 (Based on llama.cpp b-10991)";
+}
+
+const char * lumina_project_github(void) {
+    return "https://github.com/Happy-380/Lumina-Engine";
+}
+
+const char * lumina_project_donate(void) {
+    return "https://afdian.com/a/lumi_380";
+}
+
+const char * lumina_developer_bilibili(void) {
+    return "https://space.bilibili.com/3546376302496335";
+}
+
+void llama_print_lumina_banner(FILE * stream) {
+    fprintf(stream, "%s\n", llama_build_info());
+    fprintf(stream, "  GitHub   : %s\n", lumina_project_github());
+    fprintf(stream, "  Donate   : %s  (tip the developer / support development)\n", lumina_project_donate());
+    fprintf(stream, "  Bilibili : %s\n", lumina_developer_bilibili());
 }
 
 void llama_print_build_info(const char * llama_version, FILE * stream) {
     fprintf(stream, "version: %s (build %d, commit %s)\n", llama_version, llama_build_number(), llama_commit());
     fprintf(stream, "built with %s for %s\n", llama_compiler(), llama_build_target());
+    llama_print_lumina_banner(stream);
 }

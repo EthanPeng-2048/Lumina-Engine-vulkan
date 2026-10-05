@@ -580,6 +580,27 @@ int main(int argc, char ** argv) {
         params.no_extra_bufts = true;
     }
 
+    // Training backward kernels are CPU-only. When a GPU backend (e.g. Vulkan) is present the
+    // graph scheduler would otherwise offload some forward ops, which corrupts the training
+    // metrics (accuracy) and can change gradients. Force a pure-CPU training run.
+    const bool allow_gpu_train = getenv("LUMINA_TRAIN_ALLOW_GPU") != nullptr;
+    if (!allow_gpu_train) {
+        if (params.n_gpu_layers != 0) {
+            LOG_INF("%s: forcing n_gpu_layers = 0 (training backward pass is CPU-only)\n", __func__);
+            params.n_gpu_layers = 0;
+        }
+        if (!params.no_op_offload) {
+            LOG_INF("%s: disabling GPU op-offload (training backward pass is CPU-only)\n", __func__);
+            params.no_op_offload = true;
+        }
+    } else {
+        LOG_WRN("%s: LUMINA_TRAIN_ALLOW_GPU is set: GPU offload allowed for training "
+                "(EXPERIMENTAL - only CPU implements the backward kernels, results may be wrong)\n", __func__);
+    }
+    // mark as explicit so the automatic device policy does not re-enable offload
+    params.n_gpu_layers_set  = true;
+    params.no_op_offload_set = true;
+
     if (params.out_file.empty()) {
         params.out_file = full_finetune ? "lumina-finetuned.gguf" : "lumina-lora.gguf";
     }

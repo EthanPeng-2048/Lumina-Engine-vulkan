@@ -471,6 +471,7 @@ struct common_params {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
+    bool    n_gpu_layers_set   = false; // user explicitly passed -ngl (disables the automatic device policy)
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
@@ -579,6 +580,7 @@ struct common_params {
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
+    bool no_op_offload_set = false; // user explicitly passed --op-offload/--no-op-offload
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 

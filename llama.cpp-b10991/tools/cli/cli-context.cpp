@@ -2,6 +2,7 @@
 #include "cli-ui.h"
 
 #include "arg.h"
+#include "build-info.h"
 #include "base64.hpp"
 #include "log.h"
 #include "console.h"
@@ -427,6 +428,9 @@ int cli_context::run() {
     banner += LLAMA_ASCII_LOGO;
     banner += "\n";
     banner += "build      : " + build_info + "\n";
+    banner += "GitHub     : " + std::string(lumina_project_github()) + "\n";
+    banner += "Donate     : " + std::string(lumina_project_donate()) + "  (tip the developer / support development)\n";
+    banner += "Bilibili   : " + std::string(lumina_developer_bilibili()) + "\n";
     banner += "model      : " + model_name + "\n";
     if (!model_ftype.empty()) {
         banner += "ftype      : " + model_ftype + "\n";

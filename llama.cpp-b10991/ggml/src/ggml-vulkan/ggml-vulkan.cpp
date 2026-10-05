@@ -19736,7 +19736,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 && ggml_are_same_shape(op->src[1], op)
                 && ggml_is_contiguous(op) && op->type == GGML_TYPE_F32;
         case GGML_OP_COUNT_EQUAL:
-            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_I32
+            // Lumina-Engine: the Vulkan shader writes a 32-bit count, while ggml_count_equal
+            // produces an I64 tensor (used by the training accuracy metric). Restrict Vulkan
+            // to I32 destinations and let I64 fall back to the CPU implementation.
+            return op->type == GGML_TYPE_I32
+                && ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_I32
                 && ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_I32;
         case GGML_OP_IM2COL:
             return ggml_is_contiguous(op->src[1])

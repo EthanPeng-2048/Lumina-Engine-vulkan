@@ -1270,6 +1270,33 @@ static void common_init_sampler_from_model(
     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA),    sparams.mirostat_eta,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
 }
 
+static bool common_model_has_experts(const llama_model * model) {
+    if (model == nullptr) {
+        return false;
+    }
+
+    static const char suffix[] = ".expert_count";
+    const size_t      slen     = sizeof(suffix) - 1;
+
+    const int32_t n_meta = llama_model_meta_count(model);
+    for (int32_t i = 0; i < n_meta; ++i) {
+        char key[512];
+        if (llama_model_meta_key_by_index(model, i, key, sizeof(key)) < 0) {
+            continue;
+        }
+        const size_t len = strlen(key);
+        if (len <= slen || strcmp(key + len - slen, suffix) != 0) {
+            continue;
+        }
+        char val[64];
+        if (llama_model_meta_val_str(model, key, val, sizeof(val)) > 0 && atoi(val) > 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 struct common_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -1335,6 +1362,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     if (model_only) {
         return;
+    }
+
+    // MoE models (e.g. SmallThinker) are faster with op-offload disabled on integrated GPUs:
+    // the expert gather plus host<->device synchronisation overhead outweighs the GPU benefit.
+    if (!params.no_op_offload_set && cparams.op_offload && common_model_has_experts(model)) {
+        COM_INF("%s", "MoE model detected: disabling GPU op-offload (CPU is faster for MoE here)\n");
+        cparams.op_offload = false;
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -1681,6 +1715,26 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     if (!params.devices.empty()) {
         mparams.devices = params.devices.data();
+    }
+
+    // Machine-aware device policy for a single prebuilt binary:
+    //   * no GPU             -> CPU only (n_gpu_layers = 0)
+    //   * integrated GPU only -> keep model layers on the CPU and rely on op-offload (0)
+    //   * discrete GPU present -> offload layers as before (auto, fit to VRAM)
+    // An explicit -ngl always overrides this.
+    if (!params.n_gpu_layers_set) {
+        bool has_discrete_gpu = false;
+        bool has_any_gpu      = false;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(ggml_backend_dev_get(i));
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU)  { has_discrete_gpu = true; has_any_gpu = true; }
+            if (type == GGML_BACKEND_DEVICE_TYPE_IGPU) { has_any_gpu = true; }
+        }
+        params.n_gpu_layers = has_discrete_gpu ? -1 : 0;
+        COM_INF("%s: device policy: %s -> n_gpu_layers = %d\n", __func__,
+                has_discrete_gpu ? "discrete GPU present, offloading layers" :
+                (has_any_gpu ? "integrated GPU, keeping layers on CPU" : "no GPU, CPU only"),
+                params.n_gpu_layers);
     }
 
     mparams.n_gpu_layers    = params.n_gpu_layers;
