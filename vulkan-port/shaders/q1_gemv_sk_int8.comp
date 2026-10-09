@@ -1,0 +1,64 @@
+#version 450
+// Split-K Q1_0 GEMV (ported 1-bit kernel) with a proper GPU work distribution.
+//
+// One workgroup per output row; the 64 threads split the K blocks and reduce through
+// shared memory. This is the GPU analogue of the CPU kernel grouping rows/columns so
+// that the (expensive) per-128 work is spread over many lanes.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform params { uint M; uint K; uint nb; } p;
+
+layout(std430, binding = 0) readonly  buffer A { uint8_t a[];  }; // raw Q1_0 blocks (18 B)
+layout(std430, binding = 1) readonly  buffer B { int8_t  bq[]; }; // int8 activations [K]
+layout(std430, binding = 2) readonly  buffer S { float   bs[]; }; // per-128 activation scale [nb]
+layout(std430, binding = 3) writeonly buffer D { float   d[];  };
+
+shared float red[64];
+
+int pack_i8(int8_t x0, int8_t x1, int8_t x2, int8_t x3) {
+    return int(uint(x0) & 0xFFu | ((uint(x1) & 0xFFu) << 8u) |
+               ((uint(x2) & 0xFFu) << 16u) | ((uint(x3) & 0xFFu) << 24u));
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    if (row >= p.M) { return; }
+
+    float acc = 0.0;
+    for (uint ib = tid; ib < p.nb; ib += 64u) {
+        const uint off = (row * p.nb + ib) * 18u;
+        const float dm = unpackHalf2x16(uint(a[off]) | (uint(a[off + 1u]) << 8u)).x;
+        const uint ab  = ib * 128u;
+        int t32 = 0;
+        for (uint k = 0u; k < 4u; ++k) {
+            const uint base = off + 2u + k * 4u;
+            const uint w32 = uint(a[base]) | (uint(a[base + 1u]) << 8u) |
+                             (uint(a[base + 2u]) << 16u) | (uint(a[base + 3u]) << 24u);
+            for (uint g = 0u; g < 8u; ++g) {
+                const uint w4 = (w32 >> (g * 4u)) & 15u;
+                const int  pb = int((w4 * 0x00204081u) & 0x01010101u);
+                const uint ai = ab + k * 32u + g * 4u;
+                const int  a0 = int(bq[ai]), a1 = int(bq[ai + 1u]), a2 = int(bq[ai + 2u]), a3 = int(bq[ai + 3u]);
+                const int  pa = pack_i8(int8_t(a0), int8_t(a1), int8_t(a2), int8_t(a3));
+                t32 += 2 * dotPacked4x8EXT(pb, pa) - (a0 + a1 + a2 + a3);
+            }
+        }
+        acc += dm * bs[ib] * float(t32);
+    }
+
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) { red[tid] += red[tid + s]; }
+        barrier();
+    }
+    if (tid == 0u) { d[row] = red[0]; }
+}

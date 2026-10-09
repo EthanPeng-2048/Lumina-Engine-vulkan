@@ -1,0 +1,79 @@
+#version 450
+// 1-bit Q1_0 GEMV ported from the CPU path (ggml-cpu/q1t.cpp, kernel q1t_gemv).
+//
+// The CPU optimisation keeps the binary {-1,+1} weights as int8 signs, quantises the
+// activation to int8 with ONE scale per 128 weights (Q8_128), accumulates the four
+// 32-weight sub-blocks in int32 (vpdpbusd / VNNI) and converts to float once per 128-block.
+// This shader is the same recipe on the GPU:
+//   * the sign bit is applied with an integer select (the vpsignb analogue),
+//   * the 4-wide int8 dot product uses the DP4A instruction
+//     (GL_EXT_integer_dot_product -> dotPacked4x8EXT -> OpSDot / VK DP4A),
+//   * one fp32 conversion + scale per 128-weight block.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform params {
+    uint M;   // number of output rows
+    uint K;   // contraction length
+    uint nb;  // K / 128
+} p;
+
+// A: raw Q1_0 blocks, 18 bytes each
+layout(std430, binding = 0) readonly  buffer A { uint8_t a[]; };
+// Bq: int8 activations [K] (per-128 quantised)
+layout(std430, binding = 1) readonly  buffer B { int8_t  bq[]; };
+// Bs: per-128 activation scales [nb]
+layout(std430, binding = 2) readonly  buffer S { float   bs[]; };
+// D: fp32 output [M]
+layout(std430, binding = 3) writeonly buffer D { float   d[]; };
+
+// pack four int8 values into one int32 (little-endian byte order, as DP4A expects)
+int pack_i8(int8_t x0, int8_t x1, int8_t x2, int8_t x3) {
+    return int(uint(x0) & 0xFFu | ((uint(x1) & 0xFFu) << 8u) |
+               ((uint(x2) & 0xFFu) << 16u) | ((uint(x3) & 0xFFu) << 24u));
+}
+
+// four weight bits -> four int8 signs (+1 keeps the activation, -1 negates it) : the vpsignb analogue
+int pack_sign4(uint w4) {
+    int r = 0;
+    for (uint i = 0u; i < 4u; ++i) {
+        const int s = ((w4 >> i) & 1u) != 0u ? 1 : -1;
+        r |= (s & 0xFF) << (8 * int(i));
+    }
+    return r;
+}
+
+void main() {
+    const uint r = gl_GlobalInvocationID.x;
+    if (r >= p.M) { return; }
+
+    float acc = 0.0;
+    for (uint ib = 0u; ib < p.nb; ++ib) {
+        const uint off = (r * p.nb + ib) * 18u;
+        const float dm = unpackHalf2x16(uint(a[off]) | (uint(a[off + 1u]) << 8u)).x;
+
+        int t32 = 0; // int32 accumulator shared by the four 32-weight sub-blocks
+        for (uint k = 0u; k < 4u; ++k) {
+            const uint base = off + 2u + k * 4u;
+            const uint w32 = uint(a[base]) | (uint(a[base + 1u]) << 8u) |
+                             (uint(a[base + 2u]) << 16u) | (uint(a[base + 3u]) << 24u);
+            for (uint g = 0u; g < 8u; ++g) {
+                const uint w4 = (w32 >> (g * 4u)) & 0xFu;
+                const int  pw = pack_sign4(w4);
+                const uint ai = ib * 128u + k * 32u + g * 4u;
+                const int  pa = pack_i8(bq[ai], bq[ai + 1u], bq[ai + 2u], bq[ai + 3u]);
+                t32 += dotPacked4x8EXT(pw, pa);
+            }
+        }
+
+        // single fp32 conversion + scale per 128-weight block, exactly like the CPU path
+        acc += dm * bs[ib] * float(t32);
+    }
+    d[r] = acc;
+}

@@ -1,0 +1,142 @@
+#version 450
+// Tunable strip-GEMV for the Q1_0 (1-bit) weights on the repacked layout (32-row groups), used to
+// sweep block shape / occupancy / instruction mix in the standalone harness.
+//
+//   * one lane owns one output row per (32-row) layout group, so a warp's 32 weight records are
+//     consecutive -> coalesced reads,
+//   * the K range of the group is split over NSTRIP warps and reduced through shared memory,
+//   * RPL: how many 32-row layout groups one workgroup covers -> each lane then owns RPL rows and
+//     the activation block is loaded once per (ib) and reused for all RPL rows.
+//   * AVVEC=1 fetches the 4 activation bytes of one DP4A as part of a uvec4 load (4 DP4A per load)
+//     instead of one u32 load per DP4A,
+//   * FAST=1 uses the CPU q1t identity dot(a,w) = 2*dot(a,bits) - sum(a): the weight nibble only
+//     needs the 0/1 spread (2 ALU ops) and sum(a) over 128 values is precomputed in axs[].
+//   * MODE=1 turns the kernel into a pure bandwidth probe (stream the records, dummy sum).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
+#ifndef NSTRIP
+#define NSTRIP 8
+#endif
+#ifndef AVVEC
+#define AVVEC 0
+#endif
+#ifndef FAST
+#define FAST 0
+#endif
+#ifndef RPL
+#define RPL 1
+#endif
+#ifndef MODE
+#define MODE 0
+#endif
+
+layout(local_size_x = 32u * NSTRIP) in;
+
+layout(push_constant) uniform params { uint M; uint K; uint nb; } p;
+
+layout(std430, binding = 0) readonly  buffer C    { uint8_t codes[];  }; // 16 B per (group,ib,lane)
+layout(std430, binding = 0) readonly  buffer C4   { uvec4   codes4[]; }; // same, vector view
+layout(std430, binding = 1) readonly  buffer S    { uint16_t dsc[];   }; // fp16 scale per record
+layout(std430, binding = 2) readonly  buffer BQ   { int8_t  bq[];     }; // int8 activations [K]
+layout(std430, binding = 2) readonly  buffer BQ32 { uint    bq32[];   }; // same, 4 int8 per u32
+layout(std430, binding = 2) readonly  buffer BQ16 { uvec4   bq16[];   }; // same, 16 int8 per uvec4
+layout(std430, binding = 3) readonly  buffer BS   { float   bs[];     }; // per-128 scale [nb]
+layout(std430, binding = 4) writeonly buffer D    { float   d[];      };
+layout(std430, binding = 5) readonly  buffer AXS  { float   axs[];    }; // per-128 sum(a) (FAST)
+
+shared float sred[32u * NSTRIP * RPL];
+
+// t = sum over the 128 weights of a_i * bits_i   (bits are the raw 1-bit weights)
+int dot_blk(uvec4 wv, uint ab
+#if AVVEC
+            , const uvec4 av[8]
+#endif
+           ) {
+    int t = 0;
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+        const uint w32 = wv[k];
+        [[unroll]] for (uint gg = 0u; gg < 8u; ++gg) {
+            const uint nib = (w32 >> (gg * 4u)) & 15u;
+            const uint m   = (nib * 0x00204081u) & 0x01010101u; // four 0/1 bytes
+#if FAST
+            const int w4 = int(m);
+#else
+            const int w4 = int(0x01010101u | ((m ^ 0x01010101u) * 0xFEu)); // +1 / -1 bytes
+#endif
+            const uint j = k * 8u + gg;
+#if AVVEC
+            t += dotPacked4x8EXT(w4, int(av[j >> 2u][j & 3u]));
+#else
+            t += dotPacked4x8EXT(w4, int(bq32[ab + j]));
+#endif
+        }
+    }
+    return t;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint w   = tid >> 5u;      // warp / K strip
+    const uint l   = tid & 31u;      // row inside a 32-row group
+    const uint g0  = gl_WorkGroupID.x * RPL;
+
+    const uint s_per = (p.nb + NSTRIP - 1u) / NSTRIP;
+    const uint ib0   = w * s_per;
+    const uint ib1   = min(p.nb, ib0 + s_per);
+
+    float acc[RPL];
+    [[unroll]] for (uint k = 0u; k < RPL; ++k) acc[k] = 0.0;
+
+    for (uint ib = ib0; ib < ib1; ++ib) {
+#if AVVEC
+        uvec4 av[8];
+        [[unroll]] for (uint q = 0u; q < 8u; ++q) av[q] = bq16[ib * 8u + q];
+#endif
+        const float act = bs[ib];
+#if FAST
+        const float aavg = axs[ib];
+#endif
+        [[unroll]] for (uint k = 0u; k < RPL; ++k) {
+            const uint G   = g0 + k;
+            const uint rec = (G * p.nb + ib) * 32u + l;
+            const float dm = unpackHalf2x16(uint(dsc[rec])).x;
+#if MODE >= 1
+            const uvec4 wv = codes4[rec];
+            acc[k] += float((wv.x ^ wv.y ^ wv.z ^ wv.w) & 1023u);
+#if MODE == 2
+            acc[k] += unpackHalf2x16(uint(dsc[rec])).x;
+#endif
+#else
+            const int t = dot_blk(codes4[rec], ib * 32u
+#if AVVEC
+                                  , av
+#endif
+                                 );
+#if FAST
+            acc[k] += dm * act * (2.0 * float(t) - aavg);
+#else
+            acc[k] += dm * act * float(t);
+#endif
+#endif
+        }
+    }
+
+    [[unroll]] for (uint k = 0u; k < RPL; ++k) sred[(w * RPL + k) * 32u + l] = acc[k];
+
+    barrier();
+    if (w == 0u) {
+        [[unroll]] for (uint k = 0u; k < RPL; ++k) {
+            const uint m = (g0 + k) * 32u + l;
+            if (m < p.M) {
+                float s = 0.0;
+                [[unroll]] for (uint i = 0u; i < NSTRIP; ++i) { s += sred[(i * RPL + k) * 32u + l]; }
+                d[m] = s;
+            }
+        }
+    }
+}

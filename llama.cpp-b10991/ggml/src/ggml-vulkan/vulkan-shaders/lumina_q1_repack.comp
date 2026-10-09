@@ -1,0 +1,46 @@
+#version 450
+// Lumina: repack a Q1_0 weight tensor ([M][nb] blocks of 18 B: fp16 d + 16 code bytes) into the
+// block-major / 32-row-merged layout the DP4A GEMV wants (equivalent of the CPU Q1LUT repack):
+//
+//   codes[(g*nb + ib)*32 + l]  = the 16 sign-bit bytes of row g*32+l, block ib
+//   dsc  [(g*nb + ib)*32 + l]  = its fp16 scale
+//
+// The code bytes are 16 B aligned and a warp's 32 records are consecutive, so the GEMV can use
+// one uvec4 load per 128 weights instead of 16 byte loads (and one DRAM sector instead of two).
+// Rows past M are zero filled.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform params { uint M; uint K; uint nb; } p;
+
+layout(std430, binding = 0) readonly  buffer A  { uint8_t a[];     }; // raw Q1_0 [M][nb] x 18 B
+layout(std430, binding = 1) writeonly buffer C  { uint8_t codes[]; }; // 16 B per record
+layout(std430, binding = 1) writeonly buffer C4 { uvec4   codes4[];}; // same, vector view
+layout(std430, binding = 2) writeonly buffer S  { uint16_t dsc[];  }; // fp16 per record
+
+void main() {
+    const uint g   = gl_WorkGroupID.x;
+    const uint ib  = gl_WorkGroupID.y;
+    const uint l   = gl_LocalInvocationID.x;
+    const uint m   = g * 32u + l;
+    const uint rec = (g * p.nb + ib) * 32u + l;
+
+    if (m < p.M) {
+        const uint src = (m * p.nb + ib) * 18u;
+        uint w[4];
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            w[k] = uint(a[src + 2u + k * 4u]) | (uint(a[src + 3u + k * 4u]) << 8u) |
+                   (uint(a[src + 4u + k * 4u]) << 16u) | (uint(a[src + 5u + k * 4u]) << 24u);
+        }
+        codes4[rec] = uvec4(w[0], w[1], w[2], w[3]);
+        dsc[rec] = uint16_t(a[src]) | (uint16_t(a[src + 1u]) << 8u);
+    } else {
+        codes4[rec] = uvec4(0u);
+        dsc[rec] = uint16_t(0);
+    }
+}

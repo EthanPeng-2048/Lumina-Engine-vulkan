@@ -1,0 +1,105 @@
+#version 450
+// Lumina: Q1_0 GEMV (token generation, N = 1) on the repacked weight layout produced by
+// lumina_q1_repack.comp, with 1-bit weights + per-128 int8 activations + DP4A.
+//
+// This is the CPU q1t idea on the GPU. Four things are what make it fast (each validated by
+// an A/B experiment in vulkan-port/):
+//
+//   * repacked, coalesced weights: a lane owns one output row, so a warp reads 32 consecutive
+//     16-byte records per (block) -> one fully used 512 B run per warp and one uvec4 load per
+//     128 weights (the original 18-byte interleaved layout only reaches ~1/8 of this),
+//   * K split over NSTRIP warps with a shared-memory reduction, so a 32-row group is worked on
+//     by 8 warps -> enough warps in flight to hide the DRAM latency,
+//   * RPL = 2 layout groups per workgroup: each lane owns two rows and therefore loads the
+//     (broadcast) activation block once for both -> fewer load instructions per output element,
+//   * the CPU q1t identity dot(a, w) = 2 * dot(a, bits) - sum(a): the weight nibble only needs the
+//     two-instruction 0/1 spread (nib * 0x00204081 & 0x01010101), the +-1 conversion is gone, and
+//     sum(a) over the 128 activations is a constant per block (precomputed in axs[] by
+//     lumina_q1_quantize.comp with -DLUMINA_Q1_Q8_AXSUM). This cuts the inner-loop ALU by ~40%.
+//
+// Measured on the CMP 40HX (Turing TU106), m=4096 n=1 k=14336, single-submit口径:
+//   native dequant-to-fp32 GEMV   88.3 us
+//   this kernel                   25.0 us   (3.5x)   ~330 GB/s effective
+//   pure weight-streaming probe   21.4 us   (the codes+dsc traffic itself), i.e. ~85% of ceiling.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
+#define NSTRIP 8u
+#define RPL    2u
+
+layout(local_size_x = 32u * NSTRIP) in;
+
+layout(push_constant) uniform params { uint M; uint K; uint nb; } p;
+
+layout(std430, binding = 0) readonly  buffer C    { uint8_t codes[];  }; // 16 B per (group,ib,lane)
+layout(std430, binding = 0) readonly  buffer C4   { uvec4   codes4[]; }; // same, vector view
+layout(std430, binding = 1) readonly  buffer S    { uint16_t dsc[];   }; // fp16 scale per record
+layout(std430, binding = 2) readonly  buffer BQ   { int8_t  bq[];     }; // int8 activations [K]
+layout(std430, binding = 2) readonly  buffer BQ16 { uvec4   bq16[];   }; // same, 16 int8 per uvec4
+layout(std430, binding = 3) readonly  buffer BS   { float   bs[];     }; // per-128 activation scale
+layout(std430, binding = 4) writeonly buffer D    { float   d[];      };
+layout(std430, binding = 5) readonly  buffer AX   { float   axs[];    }; // per-128 sum(a)
+
+shared float sred[32u * NSTRIP * RPL];
+
+// t = sum over the 128 weights of a_i * bits_i (bits are the raw 1-bit weights); the sign is
+// applied afterwards through the 2*t - sum(a) identity.
+int dot_blk(uvec4 wv, const uvec4 av[8]) {
+    int t = 0;
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+        const uint w32 = wv[k];
+        [[unroll]] for (uint gg = 0u; gg < 8u; ++gg) {
+            const uint nib = (w32 >> (gg * 4u)) & 15u;
+            const uint m   = (nib * 0x00204081u) & 0x01010101u; // four 0/1 bytes
+            const uint j   = k * 8u + gg;
+            t += dotPacked4x8EXT(int(m), int(av[j >> 2u][j & 3u]));
+        }
+    }
+    return t;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint w   = tid >> 5u;      // warp / K strip
+    const uint l   = tid & 31u;      // row inside a 32-row group
+    const uint g0  = gl_WorkGroupID.x * RPL;
+
+    const uint s_per = (p.nb + NSTRIP - 1u) / NSTRIP;
+    const uint ib0   = w * s_per;
+    const uint ib1   = min(p.nb, ib0 + s_per);
+
+    float acc[RPL];
+    [[unroll]] for (uint k = 0u; k < RPL; ++k) { acc[k] = 0.0; }
+
+    for (uint ib = ib0; ib < ib1; ++ib) {
+        // the activation block is shared by the RPL rows this lane owns -> load it once
+        uvec4 av[8];
+        [[unroll]] for (uint q = 0u; q < 8u; ++q) { av[q] = bq16[ib * 8u + q]; }
+        const float act = bs[ib];
+        const float aavg = axs[ib];
+        [[unroll]] for (uint k = 0u; k < RPL; ++k) {
+            const uint rec = ((g0 + k) * p.nb + ib) * 32u + l;
+            const float dm = unpackHalf2x16(uint(dsc[rec])).x;
+            const int t = dot_blk(codes4[rec], av);
+            acc[k] += dm * act * (2.0 * float(t) - aavg);
+        }
+    }
+
+    [[unroll]] for (uint k = 0u; k < RPL; ++k) { sred[(w * RPL + k) * 32u + l] = acc[k]; }
+
+    barrier();
+    if (w == 0u) {
+        [[unroll]] for (uint k = 0u; k < RPL; ++k) {
+            const uint m = (g0 + k) * 32u + l;
+            if (m < p.M) {
+                float s = 0.0;
+                [[unroll]] for (uint i = 0u; i < NSTRIP; ++i) { s += sred[(i * RPL + k) * 32u + l]; }
+                d[m] = s;
+            }
+        }
+    }
+}

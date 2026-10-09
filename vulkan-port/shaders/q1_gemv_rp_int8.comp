@@ -1,0 +1,67 @@
+#version 450
+// The ported 1-bit Q1_0 GEMV (token generation): binary weights + per-128 int8 activations
+// + DP4A, on the permuted (coalesced) weight layout.
+//
+// Steps, mirroring ggml-cpu/q1t.cpp q1t_gemv + the Q1LUT repack:
+//   * weights live as single sign bits in a block-major, warp-coalesced layout,
+//   * the activation is int8 with ONE scale per 128 values (Q8_128),
+//   * four weight bits are spread to four 0/1 bytes with one multiply
+//     ((nibble * 0x00204081) & 0x01010101), turning the binary dot product into
+//     dot(a,w) = 2*dot(a,bits) - sum(a)   -> one DP4A per four MACs,
+//   * the four 32-weight sub-blocks accumulate in int32 and are converted to float
+//     once per 128-weight block.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform params { uint M; uint K; uint nb; } p;
+
+layout(std430, binding = 0) readonly  buffer C { uint8_t  codes[]; }; // 16 B per (group,ib,lane)
+layout(std430, binding = 1) readonly  buffer S { uint16_t dsc[];   }; // fp16 scale per (group,ib,lane)
+layout(std430, binding = 2) readonly  buffer B { int8_t   bq[];    }; // int8 activations [K]
+layout(std430, binding = 3) readonly  buffer BS { float   bs[];    }; // per-128 activation scale [nb]
+layout(std430, binding = 4) writeonly buffer D { float    d[];     };
+
+int pack_i8(int8_t x0, int8_t x1, int8_t x2, int8_t x3) {
+    return int(uint(x0) & 0xFFu | ((uint(x1) & 0xFFu) << 8u) |
+               ((uint(x2) & 0xFFu) << 16u) | ((uint(x3) & 0xFFu) << 24u));
+}
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    if (tid >= p.M) { return; }
+    const uint g = tid >> 5u;
+    const uint l = tid & 31u;
+
+    float acc = 0.0;
+    for (uint ib = 0u; ib < p.nb; ++ib) {
+        const uint rowblk = (g * p.nb + ib) * 32u + l;
+        const uint base   = rowblk * 16u;
+        const float dm    = unpackHalf2x16(uint(dsc[rowblk])).x;
+        const uint ab     = ib * 128u;
+
+        int t32 = 0;
+        for (uint k = 0u; k < 4u; ++k) {
+            const uint w32 = uint(codes[base + k * 4u]) | (uint(codes[base + k * 4u + 1u]) << 8u) |
+                             (uint(codes[base + k * 4u + 2u]) << 16u) | (uint(codes[base + k * 4u + 3u]) << 24u);
+            for (uint gg = 0u; gg < 8u; ++gg) {
+                const uint w4 = (w32 >> (gg * 4u)) & 15u;
+                // spread the low four bits to four 0/1 bytes (one multiply)
+                const int pb = int((w4 * 0x00204081u) & 0x01010101u);
+                const uint ai = ab + k * 32u + gg * 4u;
+                const int a0 = int(bq[ai]), a1 = int(bq[ai + 1u]), a2 = int(bq[ai + 2u]), a3 = int(bq[ai + 3u]);
+                const int pa = pack_i8(int8_t(a0), int8_t(a1), int8_t(a2), int8_t(a3));
+                // dot(a, w) = 2*dot(a, bits) - sum(a), with w = 2*bits - 1
+                t32 += 2 * dotPacked4x8EXT(pb, pa) - (a0 + a1 + a2 + a3);
+            }
+        }
+        acc += dm * bs[ib] * float(t32);
+    }
+    d[tid] = acc;
+}

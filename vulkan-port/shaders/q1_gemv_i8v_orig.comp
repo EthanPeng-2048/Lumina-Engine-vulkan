@@ -1,0 +1,57 @@
+#version 450
+// Same vectorised DP4A GEMV as q1_gemv_rp_i8v.comp, but reading the ORIGINAL ggml Q1_0 layout
+// ([M][nb] blocks of 18 B: fp16 scale + 16 code bytes) with no repack and no extra memory.
+//
+//   * one lane per row (lane l of warp g owns row g*32+l),
+//   * the 16 code bytes are read one byte at a time (the 2-byte scale header makes 4-byte
+//     aligned access impossible in this layout), and each byte is spread to eight signed
+//     bytes with two SWAR multiplications -> 2 DP4A per byte,
+//   * activations are read as packed u32 from an alias view (same address for all lanes in
+//     the warp, so it is an L1 broadcast).
+//
+// Cost of the original layout: a warp's 32 rows are 2016 B apart, so each 16-byte code record
+// pulls its own 32-byte sector (2x DRAM sectors) and the weight side needs 16 byte loads per
+// block instead of one uvec4.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform params { uint M; uint K; uint nb; } p;
+
+layout(std430, binding = 0) readonly  buffer A  { uint8_t a[];   }; // raw Q1_0 [M][nb] x 18 B
+layout(std430, binding = 1) readonly  buffer BQ { int8_t  bq[];  }; // int8 activations [K]
+layout(std430, binding = 1) readonly  buffer BQ4 { uint   bq32[];}; // same, 4 int8 per u32
+layout(std430, binding = 2) readonly  buffer BS { float   bs[];  }; // per-128 activation scale [nb]
+layout(std430, binding = 3) writeonly buffer D  { float   d[];   };
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    if (tid >= p.M) { return; }
+
+    float acc = 0.0;
+    const uint rowbase = tid * p.nb * 18u;
+    for (uint ib = 0u; ib < p.nb; ++ib) {
+        const uint base = rowbase + ib * 18u;
+        const float dm = unpackHalf2x16(uint(a[base]) | (uint(a[base + 1u]) << 8u)).x;
+        const uint ab = ib * 32u;
+
+        int t = 0;
+        [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+            const uint bytev = uint(a[base + 2u + j]);        // eight sign bits
+            [[unroll]] for (uint half_ = 0u; half_ < 2u; ++half_) {
+                const uint nib = (bytev >> (half_ * 4u)) & 15u;
+                const uint m  = (nib * 0x00204081u) & 0x01010101u;
+                const uint pb = 0x01010101u | ((m ^ 0x01010101u) * 0xFEu);
+                t += dotPacked4x8EXT(int(pb), int(bq32[ab + j * 2u + half_]));
+            }
+        }
+        acc += dm * bs[ib] * float(t);
+    }
+    d[tid] = acc;
+}

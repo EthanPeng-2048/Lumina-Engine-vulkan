@@ -1,0 +1,42 @@
+#version 450
+// Baseline Q1_0 GEMV: dequantise the 1-bit weights to float and run a plain fp32 MAC.
+// This mirrors what the stock ggml-vulkan backend does for GGML_TYPE_Q1_0 today
+// (mul_mat_vec.comp -> dequantize4() -> fp32 accumulate).
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform params {
+    uint M;   // number of output rows
+    uint K;   // number of columns (contraction length)
+    uint nb;  // K / 128
+} p;
+
+// A: raw Q1_0 blocks, 18 bytes each (fp16 d + 16 bytes of packed sign bits)
+layout(std430, binding = 0) readonly  buffer A { uint8_t a[]; };
+// B: fp32 activations [K]
+layout(std430, binding = 1) readonly  buffer B { float   b[]; };
+// D: fp32 output [M]
+layout(std430, binding = 2) writeonly buffer D { float   d[]; };
+
+void main() {
+    const uint r = gl_GlobalInvocationID.x;
+    if (r >= p.M) { return; }
+
+    float acc = 0.0;
+    for (uint ib = 0u; ib < p.nb; ++ib) {
+        const uint off = (r * p.nb + ib) * 18u;
+        const float dm = unpackHalf2x16(uint(a[off]) | (uint(a[off + 1u]) << 8u)).x;
+        const uint abase = ib * 128u;
+        for (uint j = 0u; j < 128u; ++j) {
+            const uint bit = (uint(a[off + 2u + (j >> 3u)]) >> (j & 7u)) & 1u;
+            const float w = (bit != 0u) ? 1.0 : -1.0;
+            acc += dm * w * b[abase + j];
+        }
+    }
+    d[r] = acc;
+}

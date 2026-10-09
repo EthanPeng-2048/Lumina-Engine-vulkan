@@ -1,0 +1,52 @@
+#version 450
+// Repacked-layout Q1_0 GEMV baseline (fp32).
+//
+// The weights are permuted once into a block-major layout (see host repack_q1):
+//   codes[ ((g*nb + ib)*32 + lane) * 16 + byte ]
+// so a warp reads 32 consecutive lanes -> 512 contiguous bytes (coalesced),
+// exactly the trick the CPU q1t path uses when it permutes the tensor into its
+// kernel layout. This isolates the arithmetic (int8 DP4A) from the memory layout.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform params { uint M; uint K; uint nb; } p;
+
+layout(std430, binding = 0) readonly  buffer C { uint8_t  codes[]; }; // 16 B per (group,ib,lane)
+layout(std430, binding = 1) readonly  buffer S { uint16_t dsc[];   }; // fp16 scale per (group,ib,lane)
+layout(std430, binding = 2) readonly  buffer B { float    bf[];    }; // fp32 activations [K]
+layout(std430, binding = 3) writeonly buffer D { float    d[];     };
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    if (tid >= p.M) { return; }
+    const uint g = tid >> 5u;
+    const uint l = tid & 31u;
+
+    float acc = 0.0;
+    for (uint ib = 0u; ib < p.nb; ++ib) {
+        const uint rowblk = (g * p.nb + ib) * 32u + l;
+        const uint base   = rowblk * 16u;
+        const float dm    = unpackHalf2x16(uint(dsc[rowblk])).x;
+        const uint ab     = ib * 128u;
+        for (uint k = 0u; k < 4u; ++k) {
+            const uint w32 = uint(codes[base + k * 4u]) | (uint(codes[base + k * 4u + 1u]) << 8u) |
+                             (uint(codes[base + k * 4u + 2u]) << 16u) | (uint(codes[base + k * 4u + 3u]) << 24u);
+            for (uint gg = 0u; gg < 8u; ++gg) {
+                const uint  w4 = (w32 >> (gg * 4u)) & 15u;
+                const uint  ai = ab + k * 32u + gg * 4u;
+                float s = 0.0;
+                s += ((w4 & 1u) != 0u ? 1.0 : -1.0) * bf[ai];
+                s += ((w4 & 2u) != 0u ? 1.0 : -1.0) * bf[ai + 1u];
+                s += ((w4 & 4u) != 0u ? 1.0 : -1.0) * bf[ai + 2u];
+                s += ((w4 & 8u) != 0u ? 1.0 : -1.0) * bf[ai + 3u];
+                acc += dm * s;
+            }
+        }
+    }
+    d[tid] = acc;
+}
