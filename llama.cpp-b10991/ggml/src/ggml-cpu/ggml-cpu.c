@@ -1822,47 +1822,60 @@ static void ggml_compute_forward_mul_mat_id_back_b(
     ggml_to_float_t to_float = is_f32 ? (ggml_to_float_t) NULL : ggml_get_type_traits(as->type)->to_float;
     GGML_ASSERT(is_f32 || to_float != NULL);
 
-    float * scratch = (float *) params->wdata;
-    if (scratch != NULL) {
-        scratch += (size_t) ith * ne00;
-    }
+    // Shared dequantization tile: one whole expert matrix [ne00, ne01]. Each expert
+    // is dequantized once and reused for every token routed to it. The previous
+    // implementation dequantized a row again for every (token, expert, row) triple,
+    // which dominated the MoE backward pass on quantized base models.
+    float * tile = (float *) params->wdata;
 
-    for (int64_t t = ith; t < n_tok; t += nth) {
-        // zero grad_b[:, :, t]
-        for (int64_t r = 0; r < ne11; ++r) {
-            float * out = (float *) ((char *) dst->data + t*dst->nb[2] + r*dst->nb[1]);
-            memset(out, 0, ne00*sizeof(float));
+    // zero grad_b[:, :, :] once (each output element is owned by a single thread)
+    if (ith == 0) {
+        memset(dst->data, 0, ggml_nbytes(dst));
+    }
+    ggml_barrier(params->threadpool);
+
+    for (int64_t ex = 0; ex < n_as; ++ex) {
+        if (!is_f32) {
+            for (int64_t r = ith; r < ne01; r += nth) {
+                const char * arow = (const char *) as->data + ex*as->nb[2] + r*as->nb[1];
+                to_float(arow, tile + r*ne00, ne00);
+            }
+            // the tile must be complete before any thread reads it
+            ggml_barrier(params->threadpool);
         }
 
-        for (int64_t e = 0; e < n_ids; ++e) {
-            const int32_t ex = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + e*ids->nb[0]);
-            GGML_ASSERT(ex >= 0 && ex < n_as);
+        for (int64_t r = 0; r < ne01; ++r) {
+            // one dequantized src0 row is reused for every token routed to this
+            // expert, so it stays hot in cache (the previous order re-read the whole
+            // expert matrix once per token)
+            const float * row = is_f32
+                ? (const float *) ((const char *) as->data + ex*as->nb[2] + r*as->nb[1])
+                : tile + r*ne00;
 
-            const int64_t i11 = e % ne11;
+            for (int64_t t = ith; t < n_tok; t += nth) {
+                for (int64_t e = 0; e < n_ids; ++e) {
+                    const int32_t exi = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + e*ids->nb[0]);
+                    if (exi != ex) {
+                        continue;
+                    }
 
-            const float * gcol = (const float *) ((const char *) grad->data + t*grad->nb[2] + e*grad->nb[1]);
-            float * out = (float *) ((char *) dst->data + t*dst->nb[2] + i11*dst->nb[1]);
+                    const float * gcol = (const float *) ((const char *) grad->data + t*grad->nb[2] + e*grad->nb[1]);
+                    const float g = gcol[r];
+                    if (g == 0.0f) {
+                        continue;
+                    }
 
-            for (int64_t r = 0; r < ne01; ++r) {
-                const float g = gcol[r];
-                if (g == 0.0f) {
-                    continue;
-                }
+                    const int64_t i11 = e % ne11;
+                    float * out = (float *) ((char *) dst->data + t*dst->nb[2] + i11*dst->nb[1]);
 
-                const char * arow = (const char *) as->data + ex*as->nb[2] + r*as->nb[1];
-                const float * af = NULL;
-
-                if (is_f32) {
-                    af = (const float *) arow;
-                } else {
-                    to_float(arow, scratch, ne00);
-                    af = scratch;
-                }
-
-                for (int64_t c = 0; c < ne00; ++c) {
-                    out[c] += af[c] * g;
+                    ggml_vec_mad_f32(ne00, out, row, g);
                 }
             }
+        }
+
+        // all reads of the tile must finish before the next expert overwrites it
+        if (!is_f32) {
+            ggml_barrier(params->threadpool);
         }
     }
 }
@@ -3065,14 +3078,22 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_MUL_MAT_ID_BACK_B:
                     {
-                        // one dequantization row per thread
-                        cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
+                        // shared dequantization tile holding one whole expert matrix,
+                        // reused for every token that routes to that expert
+                        cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * node->src[0]->ne[1] + CACHE_LINE_SIZE;
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
                         if (ggml_is_quantized(node->src[0]->type) ||
                             node->src[0]->type == GGML_TYPE_F16) {
-                            cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
+                            // shared dequantization tile reused for every output row;
+                            // keep the per-thread single-row scratch as a lower bound so
+                            // the fallback path (batched ne2/ne3) still has enough space
+                            const int64_t ne0  = node->src[0]->ne[0];
+                            const int64_t ne01 = node->src[0]->ne[1];
+                            const size_t tile  = ggml_type_size(GGML_TYPE_F32) * ne0 * ggml_cpu_out_prod_tile(ne0, ne01) + CACHE_LINE_SIZE;
+                            const size_t rows  = ggml_type_size(GGML_TYPE_F32) * (ne0 + CACHE_LINE_SIZE_F32) * n_tasks;
+                            cur = tile > rows ? tile : rows;
                         }
                     } break;
                 case GGML_OP_SET_ROWS:
@@ -3254,6 +3275,60 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Optional per-op profiler (enable with LUMINA_OP_PROF=1). It accumulates the
+// wall-clock time spent in every ggml op across all worker threads and dumps a
+// sorted summary at process exit. Disabled by default (one branch per op).
+// ---------------------------------------------------------------------------
+static int     g_prof_on    = 0;
+static int64_t g_prof_time [GGML_OP_COUNT];
+static int64_t g_prof_calls[GGML_OP_COUNT];
+
+#if defined(_MSC_VER)
+#define GGML_PROF_ADD(ptr, val) _InterlockedExchangeAdd64((volatile __int64 *) (ptr), (__int64) (val))
+#else
+#define GGML_PROF_ADD(ptr, val) __atomic_fetch_add((ptr), (int64_t) (val), __ATOMIC_RELAXED)
+#endif
+
+static void ggml_prof_dump(void) {
+    int64_t total = 0;
+    for (int i = 0; i < GGML_OP_COUNT; ++i) {
+        total += g_prof_time[i];
+    }
+    fprintf(stderr, "=== LUMINA op profile: accumulated thread time %.2f s ===\n", total/1e6);
+    for (int done = 0; done < GGML_OP_COUNT; ) {
+        int best = -1;
+        for (int i = 0; i < GGML_OP_COUNT; ++i) {
+            if (g_prof_time[i] <= 0) {
+                continue;
+            }
+            if (best < 0 || g_prof_time[i] > g_prof_time[best]) {
+                best = i;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        fprintf(stderr, "  %-24s %9.3f s  %12" PRId64 " calls  %7.1f%%\n",
+                ggml_op_name((enum ggml_op) best), g_prof_time[best]/1e6,
+                g_prof_calls[best], 100.0*(double) g_prof_time[best]/(double) total);
+        g_prof_time[best] = 0;
+        ++done;
+    }
+}
+
+static void ggml_prof_init(void) {
+    static int done = 0;
+    if (done) {
+        return;
+    }
+    done = 1;
+    g_prof_on = getenv("LUMINA_OP_PROF") != NULL;
+    if (g_prof_on) {
+        atexit(ggml_prof_dump);
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3294,6 +3369,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        ggml_prof_init();
+        const int64_t prof_t0 = g_prof_on ? ggml_time_us() : 0;
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3301,6 +3379,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);
+        }
+
+        if (g_prof_on) {
+            GGML_PROF_ADD(&g_prof_time [node->op], ggml_time_us() - prof_t0);
+            GGML_PROF_ADD(&g_prof_calls[node->op], 1);
         }
 
         if (state->ith == 0 && cplan->abort_callback &&

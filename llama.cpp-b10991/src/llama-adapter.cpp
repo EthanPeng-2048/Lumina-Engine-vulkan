@@ -455,17 +455,14 @@ static std::vector<std::string> llama_lora_default_targets() {
     };
 }
 
-llama_adapter_lora * llama_adapter_lora_init_trainable(
-        llama_model * model,
-        uint32_t rank,
-        float alpha,
-        const char * const * targets,
-        size_t n_targets) {
-    if (model == nullptr || rank == 0) {
-        LLAMA_LOG_ERROR("%s: invalid arguments (model=%p, rank=%u)\n", __func__, (void *) model, rank);
-        return nullptr;
-    }
+struct lumina_lora_target {
+    std::string name;
+    int64_t     n_in;
+    int64_t     n_out;
+    int64_t     n_expert; // > 1 for MoE expert tensors (3D)
+};
 
+static std::vector<std::string> llama_lora_target_list(const char * const * targets, size_t n_targets) {
     std::vector<std::string> target_list;
     if (n_targets == 0) {
         target_list = llama_lora_default_targets();
@@ -476,24 +473,17 @@ llama_adapter_lora * llama_adapter_lora_init_trainable(
             }
         }
     }
+    return target_list;
+}
 
-    if (target_list.empty()) {
-        LLAMA_LOG_ERROR("%s: no LoRA targets specified\n", __func__);
-        return nullptr;
-    }
-
+static std::vector<lumina_lora_target> llama_lora_select_targets(
+        const llama_model * model,
+        const std::vector<std::string> & target_list) {
     auto str_endswith = [](const std::string & str, const std::string & suffix) {
         return str.size() >= suffix.size() && str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
     };
 
-    struct target_t {
-        std::string name;
-        int64_t     n_in;
-        int64_t     n_out;
-        int64_t     n_expert; // > 1 for MoE expert tensors (3D)
-    };
-
-    std::vector<target_t> selected;
+    std::vector<lumina_lora_target> selected;
 
     for (const auto & entry : llama_internal_get_tensor_map(model)) {
         const std::string & name = entry.first;
@@ -526,6 +516,55 @@ llama_adapter_lora * llama_adapter_lora_init_trainable(
 
         selected.push_back({ name, t->ne[0], t->ne[1], t->ne[2] });
     }
+
+    return selected;
+}
+
+// Estimate the F32 bytes of the trainable LoRA weights for the given rank/targets.
+// The AdamW training path keeps a parameter, an accumulated gradient and two momenta
+// per weight, so multiply by 4 to size the optimizer state.
+size_t llama_adapter_lora_trainable_bytes(
+        const llama_model * model,
+        uint32_t rank,
+        const char * const * targets,
+        size_t n_targets) {
+    if (model == nullptr || rank == 0) {
+        return 0;
+    }
+
+    const std::vector<std::string> target_list = llama_lora_target_list(targets, n_targets);
+    if (target_list.empty()) {
+        return 0;
+    }
+
+    size_t total = 0;
+
+    for (const lumina_lora_target & t : llama_lora_select_targets(model, target_list)) {
+        const int64_t n_expert = t.n_expert > 1 ? t.n_expert : 1;
+        total += (size_t) ((t.n_in*(int64_t) rank + (int64_t) rank*t.n_out)*n_expert)*sizeof(float);
+    }
+
+    return total;
+}
+
+llama_adapter_lora * llama_adapter_lora_init_trainable(
+        llama_model * model,
+        uint32_t rank,
+        float alpha,
+        const char * const * targets,
+        size_t n_targets) {
+    if (model == nullptr || rank == 0) {
+        LLAMA_LOG_ERROR("%s: invalid arguments (model=%p, rank=%u)\n", __func__, (void *) model, rank);
+        return nullptr;
+    }
+
+    const std::vector<std::string> target_list = llama_lora_target_list(targets, n_targets);
+    if (target_list.empty()) {
+        LLAMA_LOG_ERROR("%s: no LoRA targets specified\n", __func__);
+        return nullptr;
+    }
+
+    const std::vector<lumina_lora_target> selected = llama_lora_select_targets(model, target_list);
 
     if (selected.empty()) {
         LLAMA_LOG_ERROR("%s: no base tensors matched the LoRA targets\n", __func__);

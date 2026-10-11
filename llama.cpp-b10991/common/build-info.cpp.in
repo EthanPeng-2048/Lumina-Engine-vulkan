@@ -26,7 +26,7 @@ const char * llama_build_target(void) {
 
 const char * llama_build_info(void) {
     // Lumina-Engine build identity (kept independent of the upstream git commit count).
-    return "Build 16 (Based on llama.cpp b-10991)";
+    return "Build 19 (Based on llama.cpp b-10991)";
 }
 
 const char * lumina_project_github(void) {

@@ -4550,6 +4550,50 @@ static void ggml_compute_forward_out_prod_q_f32(
     //       for i0:
     //         dst[i0,i1,i2,i3] += src0[i0,i01,i2,i3] * src1[i1,i01,i2,i3]
 
+    if (ne02 == 1 && ne03 == 1) {
+        // Tiled path: dequantize a slab of src0 rows once into a shared scratch
+        // buffer and reuse it for every output row. For the training backward pass
+        // (n_out = n_tokens) the loop below re-dequantized each src0 row n_out
+        // times, which made OUT_PROD the single hottest op of QLoRA training.
+        const int64_t max_tile = (int64_t) (params->wsize / (ggml_type_size(GGML_TYPE_F32)*ne0));
+        int64_t n_tile = ggml_cpu_out_prod_tile(ne0, ne01);
+        if (max_tile > 0 && n_tile > max_tile) {
+            n_tile = max_tile;
+        }
+        if (n_tile < 1) {
+            n_tile = 1;
+        }
+
+        float * tile = (float *) params->wdata;
+
+        if (ith == 0) {
+            ggml_vec_set_f32(ne0*ne1, (float *) dst->data, 0);
+        }
+        ggml_barrier(params->threadpool);
+
+        for (int64_t i01_0 = 0; i01_0 < ne01; i01_0 += n_tile) {
+            const int64_t i01_1 = MIN(i01_0 + n_tile, ne01);
+
+            for (int64_t i01 = i01_0 + ith; i01 < i01_1; i01 += nth) {
+                const void * s0 = (const char *) src0->data + i01*nb01;
+                dequantize_row_q(s0, tile + (i01 - i01_0)*ne0, ne0);
+            }
+            ggml_barrier(params->threadpool);
+
+            for (int64_t i1 = ir0; i1 < ir1; ++i1) {
+                float      * d  = (float      *) ((char *)  dst->data + i1*nb1);
+                const char * s1 = (const char *) ((char *) src1->data + i1*nb10);
+
+                for (int64_t i01 = i01_0; i01 < i01_1; ++i01) {
+                    const float v = *(const float *) (s1 + i01*nb11);
+                    ggml_vec_mad_f32(ne0, d, tile + (i01 - i01_0)*ne0, v);
+                }
+            }
+            ggml_barrier(params->threadpool);
+        }
+        return;
+    }
+
     float * wdata = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32) * ith;
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {

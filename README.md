@@ -318,6 +318,9 @@ Lumina-Engine-cli.exe -m model.Q4_K_M.gguf --lora model.lora.gguf -p "..." -n 12
 | `GGML_Q1_LUT_PP=0` | 只关闭批处理（pp）查表，pp 回退到 2×4 分块 GEMM（默认启用，`ne11>=8` 时生效） |
 | `GGML_Q1_LUT_KB=N` | 查表路径的 K 分块大小（0=整表，默认且最快；>0 为实验性 L1 分块，实测更慢） |
 | `GGML_Q1_LUT_DEBUG=1` | 打印查表缓存分配/填充信息（排障；`=0` 关闭） |
+| `LUMINA_Q1_VK_GEMV=0\|1` | Vulkan Q1_0 DP4A GEMV：`0` 强制关、`1` 强制开；**默认 auto（独显开 / 集显 UMA 关）** |
+| `LUMINA_Q1_VK_CACHE_MB=N` | Vulkan Q1_0 权重重排缓存上限（MB，默认 2048，`0`=不限） |
+| `LUMINA_Q1_VK_INT8=1` | 实验性 int8 协同矩阵 prefill 路径（默认关；在本机 Turing 上慢于原生） |
 
 ---
 

@@ -277,43 +277,23 @@ static ggml_opt_dataset_t lumina_dataset_init(
 
     const int64_t ndata = ndata_train + ndata_val;
 
-    ggml_opt_dataset_t dataset = ggml_opt_dataset_init(
-        GGML_TYPE_I32, GGML_TYPE_I32, ne_datapoint, ne_datapoint, ndata, /*ndata_shard =*/ 1);
+    // Compact backing: the previous implementation stored one full n_ctx copy of every
+    // datapoint window plus its labels. With n_ctx=32768 and ~166M tokens that is about
+    // 2.6 GiB of host memory that is mostly redundant (consecutive windows overlap by
+    // half). Instead keep the token stream(s) once and materialise a window on demand.
+    const int32_t * data_val  = have_val_file ? val->tokens.data() : nullptr;
+    const uint8_t * mask_main = train.trainable.empty() ? nullptr : train.trainable.data();
+    const uint8_t * mask_val  = (have_val_file && !val->trainable.empty()) ? val->trainable.data() : nullptr;
 
-    llama_token * data   = (llama_token *) ggml_opt_dataset_data(dataset)->data;
-    llama_token * labels = (llama_token *) ggml_opt_dataset_labels(dataset)->data;
-
-    auto fill = [&](const lumina_token_stream & src, int64_t idata_begin, int64_t count, int64_t skip) {
-        for (int64_t i = 0; i < count; ++i) {
-            const int64_t src_dp = skip + i;
-            const int64_t dst    = idata_begin + i;
-
-            memcpy(data + dst*ne_datapoint, src.tokens.data() + src_dp*stride + 0, ne_datapoint*sizeof(llama_token));
-
-            for (int64_t j = 0; j < ne_datapoint; ++j) {
-                const int64_t src_pos = src_dp*stride + 1 + j;
-
-                bool trainable = true;
-                if (!src.trainable.empty() && src_pos < (int64_t) src.trainable.size()) {
-                    trainable = src.trainable[src_pos] != 0;
-                }
-
-                labels[dst*ne_datapoint + j] = trainable ? src.tokens[src_pos] : (llama_token) -1;
-            }
-        }
-    };
-
-    fill(train, 0, ndata_train, 0);
-
-    if (have_val_file) {
-        fill(*val, ndata_train, ndata_val, 0);
-    } else {
-        fill(train, ndata_train, ndata_val, ndata_train);
-    }
+    ggml_opt_dataset_t dataset = ggml_opt_dataset_init_compact(
+        GGML_TYPE_I32, GGML_TYPE_I32, ne_datapoint, ne_datapoint, ndata, /*ndata_shard =*/ 1,
+        stride, ndata_train,
+        train.tokens.data(), mask_main,
+        data_val, mask_val);
 
     idata_split = ndata_train;
 
-    LOG_INF("%s: dataset: %" PRId64 " train datapoints, %" PRId64 " val datapoints, n_ctx = %" PRId64 ", stride = %" PRId64 "\n",
+    LOG_INF("%s: dataset: %" PRId64 " train datapoints, %" PRId64 " val datapoints, n_ctx = %" PRId64 ", stride = %" PRId64 " (compact)\n",
             __func__, ndata_train, ndata_val, ne_datapoint, stride);
 
     return dataset;
@@ -534,6 +514,138 @@ static void lumina_train_callback(
     }
 }
 
+// Drop the MoE expert FFN substrings from a comma separated LoRA target list, keeping the
+// attention projections and the router. Expert weights are 3D [n_in, n_out, n_expert] and
+// adapting every one of them with rank-64 AdamW needs several GiB of optimizer state,
+// which does not fit on memory-constrained machines.
+static std::string lumina_prune_expert_targets(const std::string & csv) {
+    const std::vector<std::string> targets = lumina_split_targets(csv);
+
+    std::vector<std::string> kept;
+    bool have_router = false;
+    bool removed     = false;
+
+    for (const std::string & t : targets) {
+        if (t.rfind("ffn", 0) == 0) {
+            if (t == "ffn_gate_inp") {
+                have_router = true;
+                kept.push_back(t);
+            } else {
+                // broad FFN substrings (ffn_gate/ffn_up/ffn_down) match the huge MoE
+                // expert tensors; drop them, keep the router and everything else
+                removed = true;
+            }
+            continue;
+        }
+        kept.push_back(t);
+    }
+
+    if (!removed) {
+        // nothing to prune: keep the caller's list verbatim
+        return csv;
+    }
+
+    if (!have_router) {
+        kept.push_back("ffn_gate_inp");
+    }
+
+    std::string out;
+    for (size_t i = 0; i < kept.size(); ++i) {
+        if (i > 0) {
+            out += ",";
+        }
+        out += kept[i];
+    }
+    return out;
+}
+
+// Decide whether the requested LoRA targets fit in RAM together with the model, the KV
+// cache and the (compact) dataset. If not, drop the MoE expert FFN targets (the dominant
+// memory term) so training can proceed on low-memory machines.
+static void lumina_fit_lora_targets(
+        const llama_model * model,
+        int64_t             n_ctx,
+        size_t              dataset_tokens,
+        common_params &     params) {
+    if (params.lora_rank <= 0 || !common_model_has_experts(model)) {
+        return;
+    }
+
+    auto adapter_bytes_of = [&](const std::string & csv) -> size_t {
+        const std::vector<std::string> targets = lumina_split_targets(csv);
+        std::vector<const char *> ptrs;
+        ptrs.reserve(targets.size());
+        for (const auto & t : targets) {
+            ptrs.push_back(t.c_str());
+        }
+        return llama_adapter_lora_trainable_bytes(model, (uint32_t) params.lora_rank, ptrs.data(), ptrs.size());
+    };
+
+    const size_t adapter_bytes = adapter_bytes_of(params.lora_targets);
+    if (adapter_bytes == 0) {
+        return;
+    }
+
+    size_t free_ram  = 0;
+    size_t total_ram = 0;
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev != nullptr) {
+        ggml_backend_dev_memory(cpu_dev, &free_ram, &total_ram);
+    }
+    if (total_ram == 0) {
+        return;
+    }
+
+    std::error_code ec;
+    const size_t model_bytes = fs::file_size(params.model.path, ec);
+
+    const int64_t n_layer   = llama_model_n_layer(model);
+    const int64_t n_embd    = llama_model_n_embd(model);
+    const int64_t n_head    = llama_model_n_head(model);
+    const int64_t n_head_kv = llama_model_n_head_kv(model);
+    const int64_t head_dim  = n_head > 0 ? n_embd / n_head : 0;
+    const int64_t kv_heads  = n_head_kv > 0 ? n_head_kv : n_head;
+    const size_t  kv_bytes  = (size_t) (2*n_layer*n_ctx*kv_heads*head_dim*sizeof(float));
+
+    const size_t dataset_bytes = dataset_tokens*(sizeof(int32_t) + sizeof(uint8_t));
+    const size_t opt_bytes     = adapter_bytes*4; // parameter + grad_acc + AdamW m/v
+    const size_t overhead      = (size_t) 1536*1024*1024; // graph/activation scratch (rough)
+
+    const size_t estimated = kv_bytes + dataset_bytes + opt_bytes + overhead;
+
+    // Prune when the AdamW state alone would need more than ~45% of physical RAM. This
+    // depends only on the model + rank + total memory, so stage1/2/3 always pick the same
+    // target set (required for --init-lora), regardless of -c or dataset size.
+    const size_t adapter_budget = (size_t) (0.45*(double) total_ram);
+
+    LOG_INF("%s: LoRA weights %.2f GiB (AdamW keeps x4 = %.2f GiB, budget %.2f GiB); "
+            "estimated private working set %.2f GiB of %.2f GiB RAM "
+            "(model %.2f GiB is mmap'd and reclaimable)\n",
+            __func__, adapter_bytes/1073741824.0, opt_bytes/1073741824.0, adapter_budget/1073741824.0,
+            estimated/1073741824.0, total_ram/1073741824.0, model_bytes/1073741824.0);
+
+    if (opt_bytes <= adapter_budget) {
+        return;
+    }
+
+    const std::string pruned = lumina_prune_expert_targets(params.lora_targets);
+    if (pruned == params.lora_targets) {
+        LOG_WRN("%s: LoRA working set exceeds the available memory and no MoE expert targets "
+                "could be pruned; training may be slow or fail\n", __func__);
+        return;
+    }
+
+    const size_t pruned_bytes = adapter_bytes_of(pruned);
+
+    LOG_WRN("%s: LoRA targets do not fit in RAM: dropping MoE expert FFN targets\n", __func__);
+    LOG_WRN("%s:   '%s' -> '%s' (AdamW state %.2f -> %.2f GiB)\n", __func__,
+            params.lora_targets.c_str(), pruned.c_str(),
+            opt_bytes/1073741824.0, (pruned_bytes*4)/1073741824.0);
+    LOG_WRN("%s:   pass --lora-targets explicitly on a machine with more RAM to keep expert adapters\n", __func__);
+
+    params.lora_targets = pruned;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -593,6 +705,13 @@ int main(int argc, char ** argv) {
             LOG_INF("%s: disabling GPU op-offload (training backward pass is CPU-only)\n", __func__);
             params.no_op_offload = true;
         }
+        // Restrict the model to the CPU device list. Keeping a GPU (e.g. Vulkan) device in
+        // the list still makes its backend participate in graph buffer allocation, and on
+        // an integrated GPU those buffers are carved out of the same system RAM the
+        // training already needs -- which is what makes the tool fail with an out-of-memory
+        // error even though training only ever runs on the CPU.
+        params.devices = { nullptr };
+        LOG_INF("%s: restricting device list to CPU only\n", __func__);
     } else {
         LOG_WRN("%s: LUMINA_TRAIN_ALLOW_GPU is set: GPU offload allowed for training "
                 "(EXPERIMENTAL - only CPU implements the backward kernels, results may be wrong)\n", __func__);
@@ -669,6 +788,18 @@ int main(int argc, char ** argv) {
     }
 
     int64_t idata_split = 0;
+
+    // a NULL per-token mask means "all trainable" in the compact dataset; dropping an
+    // all-ones mask saves one byte per token (e.g. ~160 MiB for the stage-1 corpus)
+    auto drop_trivial_mask = [](lumina_token_stream & s) {
+        if (!s.trainable.empty() &&
+            std::all_of(s.trainable.begin(), s.trainable.end(), [](uint8_t v) { return v != 0; })) {
+            std::vector<uint8_t>().swap(s.trainable);
+        }
+    };
+    drop_trivial_mask(train_stream);
+    drop_trivial_mask(val_stream);
+
     ggml_opt_dataset_t dataset = lumina_dataset_init(
         ctx, train_stream, has_val_file ? &val_stream : nullptr, params.val_split, idata_split);
 
@@ -676,11 +807,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // the packed dataset owns its own copy of the data
-    std::vector<llama_token>().swap(train_stream.tokens);
-    std::vector<uint8_t>().swap(train_stream.trainable);
-    std::vector<llama_token>().swap(val_stream.tokens);
-    std::vector<uint8_t>().swap(val_stream.trainable);
+    // NOTE: the compact dataset references train_stream/val_stream (tokens + optional
+    // masks) directly, so they must stay alive until the dataset is freed. Do not free
+    // them here (they are released when main() returns, after training).
 
     struct lr_opt & lr = params.lr;
 
@@ -720,6 +849,10 @@ int main(int argc, char ** argv) {
     llama_adapter_lora * adapter = nullptr;
 
     if (!full_finetune) {
+        // reduce the LoRA target set if the MoE expert adapters would not fit in RAM
+        lumina_fit_lora_targets(model, n_ctx_train,
+                train_stream.tokens.size() + val_stream.tokens.size(), params);
+
         const std::vector<std::string> targets = lumina_split_targets(params.lora_targets);
 
         std::vector<const char *> target_ptrs;

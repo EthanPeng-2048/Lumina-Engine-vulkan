@@ -981,6 +981,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
 
+// true when the loaded model is a mixture-of-experts model (has a *.expert_count metadata key)
+bool common_model_has_experts(const llama_model * model);
+
 // model endpoint from env
 std::string common_get_model_endpoint();
 

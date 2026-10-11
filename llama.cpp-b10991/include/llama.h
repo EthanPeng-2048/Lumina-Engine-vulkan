@@ -724,6 +724,17 @@ extern "C" {
           const char * const * targets,
                       size_t   n_targets);
 
+    // Estimate the F32 bytes occupied by the trainable weights that
+    // llama_adapter_lora_init_trainable() would create for the given rank/targets.
+    // Multiply by 4 to account for the AdamW parameter, accumulated gradient and two
+    // momenta. Returns 0 on invalid arguments. Useful to decide whether a target set
+    // (e.g. MoE expert weights) fits in the available RAM.
+    LLAMA_API size_t llama_adapter_lora_trainable_bytes(
+            const struct llama_model * model,
+                             uint32_t   rank,
+                const char * const * targets,
+                             size_t   n_targets);
+
     // Save a LoRA adapter to a GGUF file using the standard llama.cpp adapter format
     // (metadata: general.type=adapter, adapter.type=lora, adapter.lora.alpha; tensors:
     // <base_tensor_name>.lora_a / .lora_b). The resulting file can be loaded with
