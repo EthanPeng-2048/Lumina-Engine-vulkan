@@ -1,0 +1,41 @@
+#version 460
+// Raw cooperative-matrix (tensor core) throughput: int8 x int8 -> int32.
+// Config from the device probe: M=16 N=16 K=32, SINT8/SINT8/SINT32.
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform P { uint iters; } p;
+
+shared int8_t sa[16 * 32];
+shared int8_t sb[32 * 16];
+shared int32_t sc[16 * 16];
+
+layout(std430, binding = 0) writeonly buffer D { int odata[]; };
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+    for (uint i = t; i < 16u * 32u; i += 32u) { sa[i] = int8_t(1); }
+    for (uint i = t; i < 32u * 16u; i += 32u) { sb[i] = int8_t(1); }
+    barrier();
+
+    coopmat<int8_t,  gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> A;
+    coopmat<int8_t,  gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> B;
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> C =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+
+    coopMatLoad(A, sa, 0, 32, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(B, sb, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+
+    for (uint i = 0u; i < p.iters; ++i) {
+        C = coopMatMulAdd(A, B, C);
+    }
+
+    coopMatStore(C, sc, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    if (t == 0u) { odata[gl_WorkGroupID.x] = sc[0]; }
+}

@@ -1,0 +1,135 @@
+#version 450
+// Lumina: Q1_0 prefill GEMM on INT8 tensor cores through NV cooperative matrix 2.
+//
+// This is the same CPU q1t logic as lumina_q1_gemm.comp (the KHR cooperative-matrix
+// version), but it uses the big-tile tensor loads of GL_NV_cooperative_matrix2 so that a
+// 64x128 weight tile is decoded inside the load instead of being staged by hand:
+//
+//   * 1-bit weights -> int8 {-1,+1}, decoded by the coopMatLoadTensorNV decode hook,
+//   * activations -> int8 with ONE scale per 128 values (Q8_128, see lumina_q1_quantize.comp),
+//   * s8 x s8 -> s32 MMA accumulation,
+//   * the per-128 scale d0[row] * d1[col] applied once per 128-weight block, exactly like the
+//     CPU path's "one float conversion per Q1_0 block" (this is what the shared-memory
+//     round trip below is for: the int32 MMA partial of a single Q1_0 block is stored to
+//     shared memory so the per-block scale can be applied before adding it to the fp32
+//     accumulator kept in registers).
+//
+// Tile: BM=64 rows x BN=64 cols, BK=128 (exactly one Q1_0 block) per K step, 128 threads.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_NV_cooperative_matrix2 : enable
+#extension GL_EXT_buffer_reference : enable
+#ifdef GGML_VULKAN_COOPMAT2_DECODE_VECTOR
+#extension GL_NV_cooperative_matrix_decode_vector : enable
+#endif
+
+#define BM 64u
+#define BN 64u
+#define BK 128u
+#define NW 128u
+
+layout(local_size_x = NW, local_size_y = 1, local_size_z = 1) in;
+
+struct lumina_block_q1_0 {
+    float16_t d;
+    uint8_t   qs[16];
+};
+
+// The layout of one Q1_0 block as seen by the tensor-core decode hook (18 bytes: fp16 d +
+// 16 bytes of sign bits), matching ggml's host-side block_q1_0.
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer luminaDecodeBufA {
+    lumina_block_q1_0 block;
+};
+
+int8_t luminaDecodeQ1I8(const in luminaDecodeBufA bl, const in uint blockCoords[2], const in uint coordInBlock[2]) {
+    const uint idx = coordInBlock[1] & 127u;
+    const uint bit = (uint(bl.block.qs[idx >> 3u]) >> (idx & 7u)) & 1u;
+    return int8_t(bit != 0u ? 1 : -1);
+}
+
+#ifdef GGML_VULKAN_COOPMAT2_DECODE_VECTOR
+// Four elements per decode call: the "decode vector" path ggml's quant matmuls use.
+i8vec4 luminaDecodeQ1I8_v(const in luminaDecodeBufA bl, const in uint blockCoords[2], const in uint coordInBlock[2]) {
+    const uint idx = coordInBlock[1] & 124u;
+    const uint nib = uint(bl.block.qs[idx >> 3u]) >> (idx & 4u);
+    return i8vec4(int8_t((nib & 1u) != 0u ? 1 : -1), int8_t((nib & 2u) != 0u ? 1 : -1),
+                  int8_t((nib & 4u) != 0u ? 1 : -1), int8_t((nib & 8u) != 0u ? 1 : -1));
+}
+#define LUMINA_DECODE_A , luminaDecodeQ1I8, luminaDecodeQ1I8_v
+#else
+#define LUMINA_DECODE_A , luminaDecodeQ1I8
+#endif
+
+layout(push_constant) uniform params { uint M; uint N; uint K; uint nb; } p;
+
+layout(std430, binding = 0) readonly  buffer A  { lumina_block_q1_0 a[]; }; // raw Q1_0 [M][nb]
+layout(std430, binding = 1) readonly  buffer BQ { int8_t bq[]; };           // int8 acts [K][N]
+layout(std430, binding = 2) readonly  buffer BS { float  bs[]; };           // per-128 scale [N][nb]
+layout(std430, binding = 3) writeonly buffer D  { float  d[];  };           // [N][M] (ggml layout)
+
+shared int32_t sPart[BM * BN];
+shared float   sD0[BM];
+shared float   sD1[BN];
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint m0  = gl_WorkGroupID.x * BM;
+    const uint n0  = gl_WorkGroupID.y * BN;
+
+    // A: Q1_0 weights, one layout block = 1 row x 128 k (= 18 bytes), row stride nb blocks.
+    tensorLayoutNV<2> lA = createTensorLayoutNV(2);
+    lA = setTensorLayoutBlockSizeNV(lA, 1u, 128u);
+    lA = setTensorLayoutDimensionNV(lA, p.M, p.K);
+    lA = setTensorLayoutStrideNV(lA, p.nb, 1u);
+
+    // B: int8 activations, [K][N] with the k index major (n contiguous) as written by
+    // lumina_q1_quantize.comp.
+    tensorLayoutNV<2> lB = createTensorLayoutNV(2);
+    lB = setTensorLayoutDimensionNV(lB, p.K, p.N);
+    lB = setTensorLayoutStrideNV(lB, p.N, 1u);
+
+    // Per-thread accumulator slice: row r = tid % BM, column c = 2*i + tid/BM.
+    const uint ar = tid & (BM - 1u);
+    const uint ac = tid / BM;
+
+    float acc[BM * BN / NW];
+    [[unroll]] for (uint i = 0u; i < BM * BN / NW; ++i) { acc[i] = 0.0; }
+
+    const coopmat<int32_t, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator> zero =
+        coopmat<int32_t, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator>(0);
+
+    for (uint ib = 0u; ib < p.nb; ++ib) {
+        coopmat<int8_t, gl_ScopeWorkgroup, BM, BK, gl_MatrixUseA> mA;
+        coopmat<int8_t, gl_ScopeWorkgroup, BK, BN, gl_MatrixUseB> mB;
+
+        coopMatLoadTensorNV(mA, a, 0u, sliceTensorLayoutNV(lA, m0, BM, ib * BK, BK) LUMINA_DECODE_A);
+        coopMatLoadTensorNV(mB, bq, 0u, sliceTensorLayoutNV(lB, ib * BK, BK, n0, BN));
+
+        const coopmat<int32_t, gl_ScopeWorkgroup, BM, BN, gl_MatrixUseAccumulator> mC = coopMatMulAdd(mA, mB, zero);
+
+        // Stage this block's int32 partial (column-major: element (r,c) at c*BM + r) and gather
+        // the per-128 scales: d0 = the Q1_0 block scale of the weight row, d1 = the activation
+        // scale of the column for this block.
+        coopMatStore(mC, sPart, 0u, BM, gl_CooperativeMatrixLayoutColumnMajor);
+        if (tid < BM) { sD0[tid] = float(a[(m0 + tid) * p.nb + ib].d); }
+        if (tid < BN) { sD1[tid] = bs[(n0 + tid) * p.nb + ib]; }
+        barrier();
+
+        const float d0v = sD0[ar];
+        [[unroll]] for (uint i = 0u; i < BM * BN / NW; ++i) {
+            acc[i] += d0v * sD1[2u * i + ac] * float(sPart[i * NW + tid]);
+        }
+        barrier();
+    }
+
+    // ggml's dst is [N][M] with the m index contiguous.
+    [[unroll]] for (uint i = 0u; i < BM * BN / NW; ++i) {
+        d[(n0 + 2u * i + ac) * p.M + m0 + ar] = acc[i];
+    }
+}

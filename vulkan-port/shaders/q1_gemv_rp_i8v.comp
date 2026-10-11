@@ -1,0 +1,63 @@
+#version 450
+// Same math as q1_gemv_rp_int8.comp (binary weights + per-128 int8 activations + DP4A on the
+// permuted/coalesced layout), but with vectorised buffer access:
+//   * the 16 code bytes of a (group, block, lane) record are fetched with ONE uvec4 load
+//     instead of 16 byte loads,
+//   * the int8 activations are fetched as packed u32 (4 activations per DP4A) from an alias
+//     view of the same binding instead of 4 byte loads (that view is read with the same
+//     address by all 32 lanes of a warp, so it is an L1 broadcast),
+//   * the four weight bits are spread straight to SIGNED bytes so the identity
+//     dot(a,w) = 2*dot(a,bits) - sum(a) is not needed:
+//       m  = (nib * 0x00204081) & 0x01010101   -> 0/1 bytes, byte i = bit i
+//       pb = 0x01010101 | ((m ^ 0x01010101) * 0xFE) -> byte i = +1 when bit i = 1, else -1
+//     (0xFE scaling has no cross-byte carries because each byte is 0 or 1)
+//
+// One lane per row (lane l of warp g owns row g*32+l), so the warp's weight reads are fully
+// coalesced (32 consecutive 16-byte records per block).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform params { uint M; uint K; uint nb; } p;
+
+layout(std430, binding = 0) readonly  buffer C   { uint8_t codes[];  }; // 16 B per (g,ib,lane)
+layout(std430, binding = 0) readonly  buffer C4  { uvec4   codes4[]; }; // same, vector view
+layout(std430, binding = 1) readonly  buffer S   { uint16_t dsc[];   }; // fp16 scale per record
+layout(std430, binding = 2) readonly  buffer BQ  { int8_t  bq[];     }; // int8 activations [K]
+layout(std430, binding = 2) readonly  buffer BQ4 { uint    bq32[];   }; // same, 4 int8 per u32
+layout(std430, binding = 3) readonly  buffer BS  { float   bs[];     }; // per-128 activation scale
+layout(std430, binding = 4) writeonly buffer D   { float   d[];      };
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    if (tid >= p.M) { return; }
+    const uint g = tid >> 5u;
+    const uint l = tid & 31u;
+
+    float acc = 0.0;
+    for (uint ib = 0u; ib < p.nb; ++ib) {
+        const uint rec = (g * p.nb + ib) * 32u + l;
+        const uvec4 w = codes4[rec];                       // 16 B = 128 weight bits
+        const float dm = unpackHalf2x16(uint(dsc[rec])).x;
+        const uint ab = ib * 32u;
+
+        int t = 0;
+        [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+            const uint w32 = w[k];
+            [[unroll]] for (uint gg = 0u; gg < 8u; ++gg) {
+                const uint nib = (w32 >> (gg * 4u)) & 15u;
+                const uint m  = (nib * 0x00204081u) & 0x01010101u; // four 0/1 bytes
+                const uint pb = 0x01010101u | ((m ^ 0x01010101u) * 0xFEu); // bit=1 -> +1, else -1
+                t += dotPacked4x8EXT(int(pb), int(bq32[ab + k * 8u + gg]));
+            }
+        }
+        acc += dm * bs[ib] * float(t);
+    }
+    d[tid] = acc;
+}

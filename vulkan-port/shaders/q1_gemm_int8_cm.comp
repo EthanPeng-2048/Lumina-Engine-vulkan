@@ -1,0 +1,104 @@
+#version 460
+// Q1_0 prefill GEMM on int8 tensor cores (cooperative matrix), following the CPU logic:
+//   * 1-bit weights decoded to int8 {-1,+1},
+//   * activations int8 with ONE scale per 128 values (Q8_128),
+//   * integer (s8 x s8 -> s32) MMA accumulation,
+//   * the per-128 scale d0[row]*d1[col] applied once per 128-weight block,
+//     exactly the "float conversion 4 -> 1" trick of the CPU q1t path.
+//
+// Tile: BM=16 rows x BN=64 cols, BK=128 (one Q1_0 block) per step.
+// One subgroup (32 lanes) drives four 16x16x32 int8 cooperative matrices.
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform params { uint M; uint N; uint K; uint nb; } p;
+
+layout(std430, binding = 0) readonly  buffer A  { uint8_t a[];  }; // raw Q1_0, [M][nb] x 18 B
+layout(std430, binding = 1) readonly  buffer B  { int8_t  bq[]; }; // int8 activations [K][N]
+layout(std430, binding = 2) readonly  buffer BS { float   bs[]; }; // per-128 activation scale [nb][N]
+layout(std430, binding = 3) writeonly buffer D  { float   d[];  }; // [M][N]
+
+#define BM 16u
+#define BN 64u
+#define BK 128u
+
+shared int8_t  sA[BM * BK];
+shared int8_t  sB[BK * BN];
+shared int32_t sC[BM * BN];
+shared float   sD0[BM];   // per-row Q1_0 scale for the current 128-block
+shared float   sD1[BN];   // per-column activation scale for the current 128-block
+
+coopmat<int8_t,  gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> mA;
+coopmat<int8_t,  gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> mB;
+coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> mC[4];
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * BM;
+    const uint col0 = gl_WorkGroupID.y * BN;
+
+    float facc[BM * BN / 32];
+    [[unroll]] for (uint i = 0u; i < BM * BN / 32u; ++i) { facc[i] = 0.0; }
+    [[unroll]] for (uint t = 0u; t < 4u; ++t)
+        mC[t] = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+
+    for (uint ib = 0u; ib < p.nb; ++ib) {
+        // decode the 1-bit weights of the A tile to int8 {-1,+1}
+        for (uint idx = tid; idx < BM * BK; idx += 32u) {
+            const uint r  = idx >> 7u;
+            const uint j  = idx & 127u;
+            const uint off = ((row0 + r) * p.nb + ib) * 18u;
+            const uint bit = (uint(a[off + 2u + (j >> 3u)]) >> (j & 7u)) & 1u;
+            sA[idx] = int8_t((bit != 0u) ? 1 : -1);
+        }
+        // stage the int8 activation tile
+        for (uint idx = tid; idx < BK * BN; idx += 32u) {
+            const uint k = idx >> 6u;
+            const uint c = idx & 63u;
+            sB[idx] = bq[(ib * BK + k) * p.N + (col0 + c)];
+        }
+        for (uint r = tid; r < BM; r += 32u) {
+            const uint ao = ((row0 + r) * p.nb + ib) * 18u;
+            sD0[r] = unpackHalf2x16(uint(a[ao]) | (uint(a[ao + 1u]) << 8u)).x;
+        }
+        for (uint c = tid; c < BN; c += 32u) {
+            sD1[c] = bs[ib * p.N + (col0 + c)];
+        }
+        barrier();
+
+        [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+            [[unroll]] for (uint kk = 0u; kk < 4u; ++kk) {
+                coopMatLoad(mA, sA, kk * 32u, 128, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(mB, sB, kk * 32u * BN + t * 16u, BN, gl_CooperativeMatrixLayoutRowMajor);
+                mC[t] = coopMatMulAdd(mA, mB, mC[t]);
+            }
+            coopMatStore(mC[t], sC, t * 16u, BN, gl_CooperativeMatrixLayoutRowMajor);
+            mC[t] = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+        }
+        barrier();
+
+        // one float conversion + scale per 128-weight block (d0[row] * d1[col])
+        [[unroll]] for (uint i = 0u; i < BM * BN / 32u; ++i) {
+            const uint e = tid + 32u * i;
+            const uint r = e >> 6u;
+            const uint c = e & 63u;
+            facc[i] += float(sC[e]) * sD0[r] * sD1[c];
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0u; i < BM * BN / 32u; ++i) {
+        const uint e = tid + 32u * i;
+        const uint r = e >> 6u;
+        const uint c = e & 63u;
+        d[(row0 + r) * p.N + (col0 + c)] = facc[i];
+    }
+}

@@ -1,0 +1,131 @@
+#version 460
+// Lumina: Q1_0 prefill GEMM on int8 tensor cores (KHR cooperative matrix), ported from the
+// CPU q1t path:
+//   * 1-bit weights decoded to int8 {-1,+1},
+//   * int8 activations with one scale per 128 values (Q8_128),
+//   * s8 x s8 -> s32 MMA accumulation,
+//   * the per-128 scale d0[row] * d1[col] applied once per 128-weight block.
+//
+// Shape: BM=32 rows x BN=64 cols, BK=128 (one Q1_0 block) per step, NW=64 threads
+// (2 subgroups, 16 rows each). The A tile (weights) is decoded once per workgroup per
+// K-block and reused across all BN columns, which is what makes the decode cheap.
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#define NW 128u
+#define BM 64u
+#define BN 32u
+#define BK 128u
+#define SG_ROWS 16u
+
+layout(local_size_x = NW) in;
+
+layout(push_constant) uniform params { uint M; uint N; uint K; uint nb; } p;
+
+layout(std430, binding = 0) readonly  buffer A  { uint8_t a[];  }; // raw Q1_0, [M][nb] x 18 B
+layout(std430, binding = 1) readonly  buffer BQ { int8_t  bq[]; }; // int8 activations [K][N]
+layout(std430, binding = 2) readonly  buffer BS { float   bs[]; }; // per-128 activation scale [N][nb]
+layout(std430, binding = 3) writeonly buffer D  { float   d[];  }; // [N][M] (ggml layout)
+
+shared int8_t  sA[BM * BK];
+shared int8_t  sB[BK * BN];
+shared int32_t sC[BM * BN];
+shared float   sD0[BM];
+shared float   sD1[BN];
+shared uvec2   sLut[256];   // byte -> eight int8 values of +/-1
+
+coopmat<int8_t,  gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> mA;
+coopmat<int8_t,  gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> mB;
+coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> mC[BN / 16u];
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint sg   = tid >> 5u;      // subgroup 0..(BM/16 - 1)
+    const uint lane = tid & 31u;
+    const uint row0 = gl_WorkGroupID.x * BM;
+    const uint col0 = gl_WorkGroupID.y * BN;
+
+    // byte -> 8x int8(+1/-1) lookup table (built once per workgroup)
+    for (uint b = tid; b < 256u; b += NW) {
+        uvec2 v = uvec2(0u);
+        [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+            const uint bytev = ((b >> j) & 1u) != 0u ? 1u : 0xFFu;
+            if (j < 4u) { v.x |= bytev << (8u * j); } else { v.y |= bytev << (8u * (j - 4u)); }
+        }
+        sLut[b] = v;
+    }
+
+    float facc[BM * BN / NW];
+    [[unroll]] for (uint i = 0u; i < BM * BN / NW; ++i) { facc[i] = 0.0; }
+    [[unroll]] for (uint t = 0u; t < BN / 16u; ++t)
+        mC[t] = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+
+    barrier();
+
+    for (uint ib = 0u; ib < p.nb; ++ib) {
+        // decode the 1-bit weights of this K-block into int8
+        for (uint idx = tid; idx < BM * 16u; idx += NW) {
+            const uint r    = idx >> 4u;             // row in tile
+            const uint byte = idx & 15u;             // byte within the 128-weight block
+            const uint src  = ((row0 + r) * p.nb + ib) * 18u + 2u + byte;
+            const uvec2 ev  = sLut[a[src]];
+            sA[r * BK + byte * 8u + 0u] = int8_t( ev.x        & 0xFFu);
+            sA[r * BK + byte * 8u + 1u] = int8_t((ev.x >>  8u) & 0xFFu);
+            sA[r * BK + byte * 8u + 2u] = int8_t((ev.x >> 16u) & 0xFFu);
+            sA[r * BK + byte * 8u + 3u] = int8_t((ev.x >> 24u) & 0xFFu);
+            sA[r * BK + byte * 8u + 4u] = int8_t( ev.y        & 0xFFu);
+            sA[r * BK + byte * 8u + 5u] = int8_t((ev.y >>  8u) & 0xFFu);
+            sA[r * BK + byte * 8u + 6u] = int8_t((ev.y >> 16u) & 0xFFu);
+            sA[r * BK + byte * 8u + 7u] = int8_t((ev.y >> 24u) & 0xFFu);
+        }
+        // stage the int8 activation tile ([K][N] source): consecutive threads walk c so the
+        // global read is coalesced and the shared store is bank-conflict free
+        for (uint idx = tid; idx < BN * BK; idx += NW) {
+            const uint k = idx / BN;
+            const uint c = idx % BN;
+            sB[k * BN + c] = bq[(ib * BK + k) * p.N + (col0 + c)];
+        }
+        for (uint r = tid; r < BM; r += NW) {
+            const uint ao = ((row0 + r) * p.nb + ib) * 18u;
+            sD0[r] = unpackHalf2x16(uint(a[ao]) | (uint(a[ao + 1u]) << 8u)).x;
+        }
+        for (uint c = tid; c < BN; c += NW) {
+            sD1[c] = bs[(col0 + c) * p.nb + ib];
+        }
+        barrier();
+
+        [[unroll]] for (uint t = 0u; t < BN / 16u; ++t) {
+            [[unroll]] for (uint kk = 0u; kk < 4u; ++kk) {
+                coopMatLoad(mA, sA, (sg * SG_ROWS) * BK + kk * 32u, BK, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(mB, sB, kk * 32u * BN + t * 16u, BN, gl_CooperativeMatrixLayoutRowMajor);
+                mC[t] = coopMatMulAdd(mA, mB, mC[t]);
+            }
+            coopMatStore(mC[t], sC, (sg * SG_ROWS) * BN + t * 16u, BN, gl_CooperativeMatrixLayoutRowMajor);
+            mC[t] = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+        }
+        barrier();
+
+        // one float conversion + scale per 128-weight block
+        [[unroll]] for (uint i = 0u; i < BM * BN / NW; ++i) {
+            const uint e = sg * (SG_ROWS * BN) + lane + 32u * i;   // absolute index in the BM x BN tile
+            const uint r = e / BN;
+            const uint c = e % BN;
+            facc[i] += float(sC[r * BN + c]) * sD0[r] * sD1[c];
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0u; i < BM * BN / NW; ++i) {
+        const uint e = sg * (SG_ROWS * BN) + lane + 32u * i;
+        const uint r = e / BN;
+        const uint c = e % BN;
+        // ggml's D is [n][m]
+        d[(col0 + c) * p.M + (row0 + r)] = facc[i];
+    }
+}

@@ -22,6 +22,8 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -1270,7 +1272,7 @@ static void common_init_sampler_from_model(
     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA),    sparams.mirostat_eta,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
 }
 
-static bool common_model_has_experts(const llama_model * model) {
+bool common_model_has_experts(const llama_model * model) {
     if (model == nullptr) {
         return false;
     }
@@ -1710,6 +1712,41 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
+// Lumina: is the model on disk predominantly a Q1_0 (1-bit) model? Only the GGUF header is read,
+// so the device policy can pick the right placement before the weights are loaded. The result is
+// cached per path because common_model_params_to_llama() is called several times per run.
+static bool common_model_file_is_q1_0(const std::string & path) {
+    static std::mutex mutex;
+    static std::map<std::string, bool> cache;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto it = cache.find(path);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    bool result = false;
+    struct gguf_init_params gguf_params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr, // tensor types only, do not allocate the data
+    };
+    struct gguf_context * ctx_gguf = gguf_init_from_file(path.c_str(), gguf_params);
+    if (ctx_gguf != nullptr) {
+        const int64_t n_tensors = gguf_get_n_tensors(ctx_gguf);
+        int64_t n_q1_0 = 0;
+        for (int64_t i = 0; i < n_tensors; ++i) {
+            if (gguf_get_tensor_type(ctx_gguf, i) == GGML_TYPE_Q1_0) {
+                ++n_q1_0;
+            }
+        }
+        result = n_q1_0 > 0 && n_q1_0 * 2 >= n_tensors;
+        gguf_free(ctx_gguf);
+    }
+
+    cache[path] = result;
+    return result;
+}
+
 struct llama_model_params common_model_params_to_llama(common_params & params) {
     auto mparams = llama_model_default_params();
 
@@ -1721,20 +1758,37 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     //   * no GPU             -> CPU only (n_gpu_layers = 0)
     //   * integrated GPU only -> keep model layers on the CPU and rely on op-offload (0)
     //   * discrete GPU present -> offload layers as before (auto, fit to VRAM)
+    //   * Q1_0 (1-bit) model + a GPU with the DP4A integer path -> offload layers even on an
+    //     integrated GPU, because the specialised Vulkan Q1_0 GEMV is 4-7x faster than the CPU
+    //     kernel there (the weights must be resident in VRAM for that kernel to be used).
     // An explicit -ngl always overrides this.
     if (!params.n_gpu_layers_set) {
         bool has_discrete_gpu = false;
         bool has_any_gpu      = false;
+        bool has_q1_dp4a_gpu  = false;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            const enum ggml_backend_dev_type type = ggml_backend_dev_type(ggml_backend_dev_get(i));
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
             if (type == GGML_BACKEND_DEVICE_TYPE_GPU)  { has_discrete_gpu = true; has_any_gpu = true; }
             if (type == GGML_BACKEND_DEVICE_TYPE_IGPU) { has_any_gpu = true; }
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                struct ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev, &props);
+                has_q1_dp4a_gpu = has_q1_dp4a_gpu || props.caps.q1_dp4a;
+            }
         }
-        params.n_gpu_layers = has_discrete_gpu ? -1 : 0;
-        COM_INF("%s: device policy: %s -> n_gpu_layers = %d\n", __func__,
-                has_discrete_gpu ? "discrete GPU present, offloading layers" :
-                (has_any_gpu ? "integrated GPU, keeping layers on CPU" : "no GPU, CPU only"),
-                params.n_gpu_layers);
+
+        const bool q1_0_model = has_q1_dp4a_gpu && common_model_file_is_q1_0(params.model.path);
+        if (q1_0_model) {
+            params.n_gpu_layers = -1;
+            COM_INF("%s: device policy: Q1_0 1-bit model + GPU with DP4A Q1 kernels -> offloading layers (n_gpu_layers = -1)\n", __func__);
+        } else {
+            params.n_gpu_layers = has_discrete_gpu ? -1 : 0;
+            COM_INF("%s: device policy: %s -> n_gpu_layers = %d\n", __func__,
+                    has_discrete_gpu ? "discrete GPU present, offloading layers" :
+                    (has_any_gpu ? "integrated GPU, keeping layers on CPU" : "no GPU, CPU only"),
+                    params.n_gpu_layers);
+        }
     }
 
     mparams.n_gpu_layers    = params.n_gpu_layers;

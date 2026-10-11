@@ -1,0 +1,43 @@
+#version 450
+// Split-K Q1_0 GEMV baseline (dequantise to fp32), same work distribution as
+// q1_gemv_sk_int8.comp so the comparison isolates the arithmetic.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform params { uint M; uint K; uint nb; } p;
+
+layout(std430, binding = 0) readonly  buffer A { uint8_t a[];  };
+layout(std430, binding = 1) readonly  buffer B { float   bf[]; };
+layout(std430, binding = 2) writeonly buffer D { float   d[];  };
+
+shared float red[64];
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    if (row >= p.M) { return; }
+
+    float acc = 0.0;
+    for (uint ib = tid; ib < p.nb; ib += 64u) {
+        const uint off = (row * p.nb + ib) * 18u;
+        const float dm = unpackHalf2x16(uint(a[off]) | (uint(a[off + 1u]) << 8u)).x;
+        const uint ab  = ib * 128u;
+        for (uint j = 0u; j < 128u; ++j) {
+            const uint bit = (uint(a[off + 2u + (j >> 3u)]) >> (j & 7u)) & 1u;
+            acc += dm * ((bit != 0u) ? 1.0 : -1.0) * bf[ab + j];
+        }
+    }
+
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) { red[tid] += red[tid + s]; }
+        barrier();
+    }
+    if (tid == 0u) { d[row] = red[0]; }
+}
