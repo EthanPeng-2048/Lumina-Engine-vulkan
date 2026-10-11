@@ -156,6 +156,11 @@ extern "C" {
         bool events;
         // mmap is supported for loading
         bool mmap_support;
+        // Lumina: the backend has a specialised Q1_0 1-bit integer path (Vulkan DP4A GEMV),
+        // so offloading a Q1_0 model to this device is a speedup rather than a regression.
+        // Appended after the upstream fields so prebuilt backend binaries stay compatible
+        // (ggml_backend_dev_get_props() zero-initialises the struct before the backend fills it).
+        bool q1_dp4a;
     };
 
     // all the device properties

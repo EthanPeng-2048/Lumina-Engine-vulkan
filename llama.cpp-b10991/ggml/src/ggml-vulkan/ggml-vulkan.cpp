@@ -977,6 +977,16 @@ struct vk_device_struct {
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
 
+    // Lumina: Q1_0 1-bit integer path. The DP4A GEMV is on by default (see
+    // ggml_vk_mul_mat_q1_0_gemv, LUMINA_Q1_VK_GEMV=0 disables it); the int8 prefill GEMM is an
+    // opt-in experiment (LUMINA_Q1_VK_INT8=1) and is slower than the native fp16 path.
+    vk_pipeline lumina_q1_quantize;
+    vk_pipeline lumina_q1_quantize_ax; // same, plus the per-128 activation sum for the GEMV
+    vk_pipeline lumina_q1_gemm;
+    vk_pipeline lumina_q1_gemm2;   // NV cooperative matrix 2 variant
+    vk_pipeline lumina_q1_repack;  // weight repack for the DP4A GEMV
+    vk_pipeline lumina_q1_gemv;    // DP4A GEMV (N = 1)
+
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
@@ -4412,6 +4422,35 @@ struct CompileTask {
     uint32_t required_subgroup_size;
 };
 
+// Lumina: should the Q1_0 DP4A GEMV be used? Default is "auto": enabled on discrete (non-UMA)
+// GPUs, where the kernel is validated, and disabled on integrated/UMA GPUs, where it currently
+// produces incorrect end-to-end results (reproduced on Intel Iris Xe: tg output degenerates to
+// repeated tokens) even though isolated MUL_MAT tests pass. LUMINA_Q1_VK_GEMV=0 forces it off
+// and LUMINA_Q1_VK_GEMV=1 forces it on (e.g. for further debugging on a UMA device).
+static bool ggml_vk_q1_gemv_enabled(const vk_device & device) {
+    static const int mode = [] {
+        const char * e = getenv("LUMINA_Q1_VK_GEMV");
+        if (e == nullptr) {
+            return 1; // auto
+        }
+        return e[0] == '0' ? 0 : 2; // 0 = off, anything else = force on
+    }();
+    if (mode == 0) {
+        return false;
+    }
+    if (mode == 2) {
+        return true;
+    }
+    return !device->uma;
+}
+
+// Lumina: is the Q1_0 DP4A path usable on this device? True only when the device exposes the
+// integer-dot-product extension and the GEMV is enabled for it, which is exactly when the
+// lumina_q1_gemv pipeline is created; otherwise the stock path is used.
+static bool ggml_vk_q1_dp4a_available(const vk_device & device) {
+    return device->integer_dot_product && ggml_vk_q1_gemv_enabled(device);
+}
+
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -5818,6 +5857,42 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
     } else {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_len, quantize_q8_1_x4_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1);
+    }
+
+    // Lumina: Q1_0 1-bit path. Only the pipelines this device can actually execute are created,
+    // so unsupported hardware leaves them null and the mul_mat dispatch falls through to the stock
+    // path instead of failing pipeline creation:
+    //   * the DP4A GEMV + activation quantiser/repacker need VK_KHR_shader_integer_dot_product,
+    //   * the int8 prefill GEMM needs int8 cooperative-matrix support.
+    // This is the automatic, per-device backend selection: model Q1_0 + Vulkan + capable hardware
+    // -> specialised kernel, anything else -> graceful fallback.
+    if (ggml_vk_q1_dp4a_available(device)) {
+        ggml_vk_create_pipeline(device, device->lumina_q1_quantize, "lumina_q1_quantize",
+            lumina_q1_quantize_len, lumina_q1_quantize_data, "main",
+            3, sizeof(uint32_t) * 3, {1, 1, 1}, {}, 1);
+        ggml_vk_create_pipeline(device, device->lumina_q1_quantize_ax, "lumina_q1_quantize_ax",
+            lumina_q1_quantize_ax_len, lumina_q1_quantize_ax_data, "main",
+            4, sizeof(uint32_t) * 3, {1, 1, 1}, {}, 1);
+        // disable robustness for these: the bounds-checked load/store path costs ~3x on this GPU
+        // NOTE: wg_denoms must be {1,1,1} here -- ggml_vk_dispatch_pipeline() divides the element
+        // counts by wg_denoms, and the host code already passes workgroup counts ({ng,nb,1} and
+        // {ngr,1,1}). With a 32 here only 1/32 of the groups were repacked/computed.
+        ggml_vk_create_pipeline(device, device->lumina_q1_repack, "lumina_q1_repack",
+            lumina_q1_repack_len, lumina_q1_repack_data, "main",
+            3, sizeof(uint32_t) * 3, {1, 1, 1}, {}, 1, true);
+        ggml_vk_create_pipeline(device, device->lumina_q1_gemv, "lumina_q1_gemv",
+            lumina_q1_gemv_len, lumina_q1_gemv_data, "main",
+            6, sizeof(uint32_t) * 3, {1, 1, 1}, {}, 1, true);
+    }
+    if (device->coopmat_support && device->coopmat_int_support) {
+        ggml_vk_create_pipeline(device, device->lumina_q1_gemm, "lumina_q1_gemm",
+            lumina_q1_gemm_cm1_len, lumina_q1_gemm_cm1_data, "main",
+            4, sizeof(uint32_t) * 4, {64, 32, 1}, {}, 1, false, true, device->subgroup_size);
+    }
+    if (device->coopmat2) {
+        ggml_vk_create_pipeline(device, device->lumina_q1_gemm2, "lumina_q1_gemm2",
+            lumina_q1_gemm2_cm2_len, lumina_q1_gemm2_cm2_data, "main",
+            4, sizeof(uint32_t) * 4, {64, 64, 1}, {}, 1, false, true, device->subgroup_size);
     }
 
     for (uint32_t i = 0; i < p021_max_gqa_ratio; ++i) {
@@ -10411,6 +10486,368 @@ static void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subc
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
 }
 
+// ---------------------------------------------------------------------------
+// Lumina: Q1_0 1-bit prefill path on int8 tensor cores.
+//
+// Enabled at runtime with the LUMINA_Q1_VK_INT8 environment variable (default off), so the
+// stock behaviour is untouched. It ports the CPU q1t logic to the GPU: activations are
+// quantised to int8 with one scale per 128 values, the 1-bit weights are decoded to int8
+// {-1,+1} and multiplied with int8 cooperative matrices (s8 x s8 -> s32), and the per-128
+// scale d0[row]*d1[col] is applied once per 128-weight block.
+// ---------------------------------------------------------------------------
+static bool ggml_vk_q1_int8_enabled() {
+    static const bool enabled = getenv("LUMINA_Q1_VK_INT8") != nullptr;
+    return enabled;
+}
+
+// The int8 GEMM exists in two flavours: the KHR cooperative-matrix one (lumina_q1_gemm) and
+// the NV cooperative-matrix-2 one (lumina_q1_gemm2, big-tile tensor loads + decode in the load).
+// The cm2 kernel is preferred when the device supports it; LUMINA_Q1_VK_CM1=1 forces the
+// original kernel so both can be compared on the same build.
+static bool ggml_vk_q1_int8_prefer_cm2() {
+    static const bool force_cm1 = getenv("LUMINA_Q1_VK_CM1") != nullptr;
+    return !force_cm1;
+}
+
+// Lumina: resolve the Vulkan buffer + offset of a tensor exactly like ggml_vk_tensor_subbuffer()
+// does: on a UMA device (integrated GPU) the tensor data may live in pinned host memory and must
+// be reached through ggml_vk_host_get(); using the raw dev_buffer there reads the wrong memory.
+// (This is what made the Q1_0 GEMV return garbage on Intel Iris Xe.)
+static void ggml_vk_q1_tensor_buffer(const ggml_backend_vk_context * ctx, const ggml_tensor * t,
+                                     vk_buffer & buf, size_t & off) {
+    buf = nullptr;
+    off = 0;
+    if (ctx->device->uma) {
+        ggml_vk_host_get(ctx->device, t->data, buf, off);
+    }
+    if (!buf) {
+        ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *) t->buffer->context;
+        buf = buf_ctx->dev_buffer;
+        off = (size_t)(vk_tensor_offset(t) + t->view_offs);
+    }
+    GGML_ASSERT(buf != nullptr);
+}
+
+static bool ggml_vk_mul_mat_q1_0_int8_supported(const vk_device & device, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    // the GEMM needs the int8 cooperative-matrix pipeline (created only on capable devices)
+    if (!device->lumina_q1_quantize || (!device->lumina_q1_gemm && !device->lumina_q1_gemm2)) {
+        return false;
+    }
+    if (!ggml_vk_q1_int8_enabled()) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_Q1_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    // 2D matmul only
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    // kernel tile constraints: K % 128, M % 64, N % 64
+    if (src0->ne[0] % 128 != 0 || src0->ne[1] % 64 != 0 || src1->ne[1] % 64 != 0) {
+        return false;
+    }
+    // prefill only; token generation is left to the existing path
+    if (src1->ne[1] < 128 || src0->ne[1] < 128) {
+        return false;
+    }
+    return true;
+}
+
+static void ggml_vk_mul_mat_q1_0_int8(ggml_backend_vk_context * ctx, vk_context& subctx,
+                                      const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const uint32_t M  = (uint32_t) src0->ne[1];
+    const uint32_t N  = (uint32_t) src1->ne[1];
+    const uint32_t K  = (uint32_t) src0->ne[0];
+    const uint32_t nb = K / 128u;
+
+    vk_buffer d_X = nullptr;
+    vk_buffer d_Y = nullptr;
+    vk_buffer d_D = nullptr;
+    size_t x_off = 0, y_off = 0, d_off = 0;
+    ggml_vk_q1_tensor_buffer(ctx, src0, d_X, x_off);
+    ggml_vk_q1_tensor_buffer(ctx, src1, d_Y, y_off);
+    ggml_vk_q1_tensor_buffer(ctx, dst,  d_D, d_off);
+
+    const uint64_t bq_sz = (uint64_t) N * K;
+    const uint64_t bs_sz = (uint64_t) N * nb * sizeof(float);
+    const uint64_t bq_pad = GGML_PAD(bq_sz, 256);
+    const uint64_t scratch = bq_pad + GGML_PAD(bs_sz, 256);
+
+    if (ctx->prealloc_size_y < scratch) {
+        ctx->prealloc_size_y = scratch;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    GGML_ASSERT(ctx->prealloc_y != nullptr && ctx->prealloc_y->size >= scratch);
+
+    const vk_subbuffer bq = { ctx->prealloc_y, 0, bq_sz };
+    const vk_subbuffer bs = { ctx->prealloc_y, bq_pad, bs_sz };
+
+    vk_pipeline gemm = ctx->device->lumina_q1_gemm;
+    if (ctx->device->coopmat2 && ctx->device->lumina_q1_gemm2 && ggml_vk_q1_int8_prefer_cm2()) {
+        gemm = ctx->device->lumina_q1_gemm2;
+    }
+    // supported() guarantees exactly one of the two exists
+    GGML_ASSERT(gemm != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->lumina_q1_quantize, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, gemm, 1);
+
+    if (ctx->prealloc_y_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    // 1) quantise the F32 activations to int8 with one scale per 128 values
+    {
+        const std::array<uint32_t, 3> pc = { { K, N, nb } };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->lumina_q1_quantize,
+            { vk_subbuffer{ d_Y, y_off, (uint64_t) N * K * sizeof(float) }, bq, bs },
+            pc, { nb, N, 1 });
+    }
+
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    // 2) int8 cooperative-matrix GEMM
+    {
+        const std::array<uint32_t, 4> pc = { { M, N, K, nb } };
+        ggml_vk_dispatch_pipeline(ctx, subctx, gemm,
+            { vk_subbuffer{ d_X, x_off, (uint64_t) ggml_nbytes(src0) }, bq, bs,
+              vk_subbuffer{ d_D, d_off, (uint64_t) M * N * sizeof(float) } },
+            pc, { M, N, 1 });
+    }
+    // see the GEMV path: prealloc_y no longer holds the stock path's cached activation quantisation
+    ctx->prealloc_y_last_pipeline_used = nullptr;
+    ctx->prealloc_y_last_tensor_used   = nullptr;
+    ctx->prealloc_y_last_k_padded      = false;
+    ctx->prealloc_y_need_sync = true;
+}
+
+// ---------------------------------------------------------------------------
+// Lumina: Q1_0 DP4A GEMV (token generation, N = 1). ON by default; set LUMINA_Q1_VK_GEMV=0 to
+// fall back to the stock dequantise-to-fp32 GEMV (e.g. when the extra repack buffer does not fit
+// in VRAM -- it costs one tensor-sized allocation per weight tensor).
+//
+// This is the CPU q1t idea on the GPU: the 1-bit weights are repacked once per tensor into a
+// block-major / 32-row-merged layout (the equivalent of the CPU Q1LUT repack; a cache is kept
+// because the repack itself costs about as much as the matmul it speeds up), the activations
+// are quantised to int8 with one scale per 128 values and the dot product is done with DP4A.
+// In the standalone harness this ran at 2362 GMAC/s vs 665 GMAC/s for the stock
+// dequantise-to-fp32 GEMV on a 4096x14336 weight matrix.
+//
+// The repack cache is invalidated whenever the weight tensor is (re)uploaded, so weights that
+// are changed after being uploaded are repacked again.
+// ---------------------------------------------------------------------------
+
+using lumina_q1_repack_key = std::pair<const void *, uint64_t>;
+
+struct lumina_q1_repack_entry {
+    vk_buffer codes;
+    vk_buffer dsc;
+    uint32_t  M;
+    uint32_t  K;
+    uint32_t  nb;
+    uint32_t  ng;
+    uint64_t  bytes;    // total VRAM held by this entry (for the cache budget)
+    uint64_t  stamp;    // last-use stamp (LRU eviction)
+};
+
+static std::mutex g_lumina_q1_repack_mutex;
+static std::map<lumina_q1_repack_key, lumina_q1_repack_entry> g_lumina_q1_repack;
+static uint64_t g_lumina_q1_repack_bytes = 0;
+static uint64_t g_lumina_q1_repack_tick  = 0;
+
+// Invalidate every cached repack that came from this device buffer (called when the weight buffer
+// is destroyed or its bytes are overwritten). Without this the entry would both leak its VRAM and,
+// once the freed vk_buffer_struct address is reused by a new allocation, alias the wrong weights.
+static void ggml_vk_q1_repack_invalidate_buffer(const void * dev_buffer) {
+    if (dev_buffer == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(g_lumina_q1_repack_mutex);
+    for (auto it = g_lumina_q1_repack.begin(); it != g_lumina_q1_repack.end(); ) {
+        if (it->first.first == dev_buffer) {
+            g_lumina_q1_repack_bytes -= it->second.bytes;
+            it = g_lumina_q1_repack.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+static void ggml_vk_q1_repack_invalidate(const void * dev_buffer, uint64_t offset) {
+    std::lock_guard<std::mutex> guard(g_lumina_q1_repack_mutex);
+    auto it = g_lumina_q1_repack.find({ dev_buffer, offset });
+    if (it != g_lumina_q1_repack.end()) {
+        g_lumina_q1_repack_bytes -= it->second.bytes;
+        g_lumina_q1_repack.erase(it);
+    }
+}
+
+// Total budget for the weight-repack cache. The cache costs ~1x the Q1_0 weight bytes, so on a
+// small card it must not be allowed to grow without bound; LUMINA_Q1_VK_CACHE_MB overrides the
+// 2 GiB default (0 = unbounded).
+static uint64_t ggml_vk_q1_repack_budget() {
+    static const uint64_t budget = [] {
+        const char * e = getenv("LUMINA_Q1_VK_CACHE_MB");
+        return e ? (uint64_t) atoll(e) << 20 : (uint64_t) 2048 << 20;
+    }();
+    return budget;
+}
+
+// Drop least-recently-used entries until `need` more bytes fit (a single entry larger than the
+// whole budget is still admitted, otherwise nothing would ever be cached).
+static void ggml_vk_q1_repack_evict_locked(uint64_t need) {
+    const uint64_t budget = ggml_vk_q1_repack_budget();
+    if (budget == 0) {
+        return;
+    }
+    while (!g_lumina_q1_repack.empty() && g_lumina_q1_repack_bytes + need > budget) {
+        auto victim = g_lumina_q1_repack.begin();
+        for (auto it = g_lumina_q1_repack.begin(); it != g_lumina_q1_repack.end(); ++it) {
+            if (it->second.stamp < victim->second.stamp) {
+                victim = it;
+            }
+        }
+        g_lumina_q1_repack_bytes -= victim->second.bytes;
+        g_lumina_q1_repack.erase(victim);
+    }
+}
+
+static bool ggml_vk_mul_mat_q1_0_gemv_supported(const vk_device & device, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    // the DP4A pipelines are created only when the device exposes integer dot product
+    if (!device->lumina_q1_gemv || !device->lumina_q1_quantize_ax || !device->lumina_q1_repack) {
+        return false;
+    }
+    if (!ggml_vk_q1_gemv_enabled(device)) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_Q1_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // single column: this kernel computes one output element per lane
+    if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    // one activation scale per 128 values (Q8_128), like the CPU path
+    if (src0->ne[0] % 128 != 0) {
+        return false;
+    }
+    return true;
+}
+
+static void ggml_vk_mul_mat_q1_0_gemv(ggml_backend_vk_context * ctx, vk_context& subctx,
+                                      const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const uint32_t M  = (uint32_t) src0->ne[1];
+    const uint32_t K  = (uint32_t) src0->ne[0];
+    const uint32_t nb = K / 128u;
+    const uint32_t ng = (M + 31u) / 32u;
+
+    vk_buffer d_X = nullptr;
+    vk_buffer d_Y = nullptr;
+    vk_buffer d_D = nullptr;
+    size_t x_off = 0, y_off = 0, d_off = 0;
+    ggml_vk_q1_tensor_buffer(ctx, src0, d_X, x_off);
+    ggml_vk_q1_tensor_buffer(ctx, src1, d_Y, y_off);
+    ggml_vk_q1_tensor_buffer(ctx, dst,  d_D, d_off);
+
+    // scratch: int8 activations [K] + one float scale per 128 values
+    const uint64_t bq_sz   = K;
+    const uint64_t bs_sz   = (uint64_t) nb * sizeof(float);
+    const uint64_t bq_pad  = GGML_PAD(bq_sz, 256);
+    const uint64_t bs_pad  = GGML_PAD(bs_sz, 256);
+    const uint64_t scratch = bq_pad + bs_pad + bs_pad; // bq | bs | axs
+
+    if (ctx->prealloc_size_y < scratch) {
+        ctx->prealloc_size_y = scratch;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    GGML_ASSERT(ctx->prealloc_y != nullptr && ctx->prealloc_y->size >= scratch);
+
+    const vk_subbuffer bq = { ctx->prealloc_y, 0, bq_sz };
+    const vk_subbuffer bs = { ctx->prealloc_y, bq_pad, bs_sz };
+    const vk_subbuffer ax = { ctx->prealloc_y, bq_pad + bs_pad, bs_sz };
+
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->lumina_q1_quantize_ax, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->lumina_q1_repack, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->lumina_q1_gemv, 1);
+
+    if (ctx->prealloc_y_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    // 1) quantise the activations to int8, one scale per 128 values (+ the per-128 sum for FAST)
+    {
+        const std::array<uint32_t, 3> pc = { { K, 1u, nb } };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->lumina_q1_quantize_ax,
+            { vk_subbuffer{ d_Y, y_off, (uint64_t) K * sizeof(float) }, bq, bs, ax },
+            pc, { nb, 1, 1 });
+    }
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    // 2) repack the weights once per tensor (cached)
+    lumina_q1_repack_entry entry;
+    {
+        std::lock_guard<std::mutex> guard(g_lumina_q1_repack_mutex);
+        auto it = g_lumina_q1_repack.find({ (const void *) d_X.get(), x_off });
+        // The key is only (buffer, offset); if a different tensor with a different shape reuses
+        // the same key (e.g. a recycled device-buffer address) the cached repack is stale. Drop
+        // it and rebuild rather than silently computing with the wrong weights/shape.
+        if (it != g_lumina_q1_repack.end() && (it->second.M != M || it->second.K != K || it->second.nb != nb)) {
+            g_lumina_q1_repack_bytes -= it->second.bytes;
+            g_lumina_q1_repack.erase(it);
+            it = g_lumina_q1_repack.end();
+        }
+        if (it == g_lumina_q1_repack.end()) {
+            const uint64_t codes_bytes = (uint64_t) ng * nb * 32u * 16u;
+            const uint64_t dsc_bytes   = (uint64_t) ng * nb * 32u * sizeof(ggml_fp16_t);
+            ggml_vk_q1_repack_evict_locked(codes_bytes + dsc_bytes);
+            // pure device-local memory: the host-visible variant is measurably slower to read
+            entry.codes = ggml_vk_create_buffer(ctx->device, codes_bytes, { vk::MemoryPropertyFlagBits::eDeviceLocal });
+            entry.dsc   = ggml_vk_create_buffer(ctx->device, dsc_bytes,   { vk::MemoryPropertyFlagBits::eDeviceLocal });
+            entry.M = M; entry.K = K; entry.nb = nb; entry.ng = ng;
+            entry.bytes = codes_bytes + dsc_bytes;
+            entry.stamp = ++g_lumina_q1_repack_tick;
+            g_lumina_q1_repack[{ (const void *) d_X.get(), x_off }] = entry;
+            g_lumina_q1_repack_bytes += entry.bytes;
+            // dispatch the repack now (one extra kernel per weight tensor)
+            const std::array<uint32_t, 3> pc = { { M, K, nb } };
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->lumina_q1_repack,
+                { vk_subbuffer{ d_X, x_off, (uint64_t) ggml_nbytes(src0) },
+                  vk_subbuffer{ entry.codes, 0, codes_bytes },
+                  vk_subbuffer{ entry.dsc,   0, dsc_bytes } },
+                pc, { ng, nb, 1 });
+            ggml_vk_sync_buffers(ctx, subctx);
+        } else {
+            it->second.stamp = ++g_lumina_q1_repack_tick; // keep it as the most-recently-used
+            entry = it->second;
+        }
+    }
+
+    // 3) DP4A GEMV
+    {
+        // the kernel covers RPL = 2 layout groups (64 rows) per workgroup
+        const uint32_t ngr = (ng + 1u) / 2u;
+        const std::array<uint32_t, 3> pc = { { M, K, nb } };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->lumina_q1_gemv,
+            { vk_subbuffer{ entry.codes, 0, (uint64_t) ng * nb * 32u * 16u },
+              vk_subbuffer{ entry.dsc,   0, (uint64_t) ng * nb * 32u * sizeof(ggml_fp16_t) },
+              bq, bs, vk_subbuffer{ d_D, d_off, (uint64_t) M * sizeof(float) }, ax },
+            pc, { ngr, 1, 1 });
+    }
+    // This op overwrote prealloc_y with its own scratch, so the f16/q8_1 activation-reuse cache
+    // tracked by the stock mul_mat_vec path is no longer valid.
+    ctx->prealloc_y_last_pipeline_used = nullptr;
+    ctx->prealloc_y_last_tensor_used   = nullptr;
+    ctx->prealloc_y_last_k_padded      = false;
+    ctx->prealloc_y_need_sync = true;
+}
+
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -10475,11 +10912,15 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
                get_misalign_bytes(ctx, src0) == 0 && get_misalign_bytes(ctx, src1) == 0 && get_misalign_bytes(ctx, dst) == 0) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx, true);
+    } else if (ggml_vk_mul_mat_q1_0_gemv_supported(ctx->device, src0, src1, dst)) {
+        ggml_vk_mul_mat_q1_0_gemv(ctx, subctx, src0, src1, dst);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+    } else if (ggml_vk_mul_mat_q1_0_int8_supported(ctx->device, src0, src1, dst)) {
+        ggml_vk_mul_mat_q1_0_int8(ctx, subctx, src0, src1, dst);
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
     }
@@ -16816,6 +17257,8 @@ static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer) {
 static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     VK_LOG_MEMORY("ggml_backend_vk_buffer_free_buffer()");
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+    // Lumina: drop the Q1_0 repack cache of this buffer (frees its VRAM and avoids stale aliases).
+    ggml_vk_q1_repack_invalidate_buffer((const void *) ctx->dev_buffer.get());
     ggml_vk_destroy_buffer(ctx->dev_buffer);
     delete ctx;
 }
@@ -16845,6 +17288,9 @@ static void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, g
 
     uint32_t val32 = (uint32_t)value * 0x01010101;
     ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
+
+    // Lumina: memset changes the weights, so a cached repack of this tensor is stale.
+    ggml_vk_q1_repack_invalidate((const void *) buf.get(), vk_tensor_offset(tensor) + tensor->view_offs);
 }
 
 static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -16857,6 +17303,9 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
     }
 
     ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+
+    // Lumina: weights whose bytes were replaced must be repacked again by the Q1_0 GEMV path.
+    ggml_vk_q1_repack_invalidate((const void *) buf.get(), vk_tensor_offset(tensor) + tensor->view_offs);
 }
 
 static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset,
@@ -16871,6 +17320,8 @@ static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, g
     }
 
     ggml_vk_buffer_write_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_data, stride_tensor, size, n_copies);
+
+    ggml_vk_q1_repack_invalidate((const void *) buf.get(), vk_tensor_offset(tensor) + tensor->view_offs);
 }
 
 static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -19212,6 +19663,7 @@ static enum ggml_backend_dev_type ggml_backend_vk_device_get_type(ggml_backend_d
 
 static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+    const vk_device & device = ggml_vk_get_device(ctx->device);
 
     props->name        = ggml_backend_vk_device_get_name(dev);
     props->description = ggml_backend_vk_device_get_description(dev);
@@ -19225,6 +19677,10 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
         /* .events                = */ true,
         /* .mmap_support          = */ !ctx->is_integrated_gpu,
     };
+    // Lumina: advertise the Q1_0 DP4A integer path so the common device policy can offload
+    // 1-bit models to this GPU (only when the device exposes integer dot product, which is
+    // exactly when the lumina Q1_0 GEMV pipeline is created).
+    props->caps.q1_dp4a = ggml_vk_q1_dp4a_available(device);
 }
 
 static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const char * params) {

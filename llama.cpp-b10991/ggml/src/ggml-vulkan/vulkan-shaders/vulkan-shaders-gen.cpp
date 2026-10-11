@@ -931,6 +931,24 @@ void process_shaders() {
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
 
+    // Lumina 1-bit Q1_0 integer path (per-128 int8 activations + int8 cooperative matrix)
+    string_to_spv("lumina_q1_quantize", "lumina_q1_quantize.comp", {});
+    // single-column variant: additionally emits the per-128 activation sum for the DP4A GEMV
+    string_to_spv("lumina_q1_quantize_ax", "lumina_q1_quantize.comp", {{"LUMINA_Q1_Q8_AXSUM", "1"}});
+    // coopmat=true disables spirv-opt for this cooperative-matrix shader (see string_to_spv_func);
+    // it also appends "_cm1" to the generated symbol name.
+    string_to_spv("lumina_q1_gemm", "lumina_q1_gemm.comp", {}, true, true);
+    // DP4A GEMV (N = 1) on a repacked weight layout, plus the repack itself.
+    string_to_spv("lumina_q1_repack", "lumina_q1_repack.comp", {});
+    string_to_spv("lumina_q1_gemv",   "lumina_q1_gemv.comp",   {});
+    // Same kernel through NV cooperative matrix 2 (big-tile tensor loads, decode in the load).
+    // The "_cm2" suffix also selects --target-env=vulkan1.3.
+#if defined(GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT)
+    string_to_spv("lumina_q1_gemm2", "lumina_q1_gemm_cm2.comp", {{"GGML_VULKAN_COOPMAT2_DECODE_VECTOR", "1"}}, true, false, true);
+#else
+    string_to_spv("lumina_q1_gemm2", "lumina_q1_gemm_cm2.comp", {}, true, false, true);
+#endif
+
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
     string_to_spv("div_f32", "div.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});

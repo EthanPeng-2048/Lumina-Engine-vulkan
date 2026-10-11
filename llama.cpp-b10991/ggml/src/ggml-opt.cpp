@@ -24,6 +24,16 @@ struct ggml_opt_dataset {
     size_t  nbs_data    = -1;
     size_t  nbs_labels  = -1;
 
+    // compact mode: datapoint windows are materialised on demand from a shared
+    // token stream instead of being stored one full copy per datapoint
+    bool            compact     = false;
+    int64_t         stride      = 0;
+    int64_t         idata_split = 0;
+    const int32_t * stream_main  = nullptr;
+    const int32_t * stream_val   = nullptr;
+    const uint8_t * mask_main    = nullptr;
+    const uint8_t * mask_val     = nullptr;
+
     std::vector<int64_t> permutation;
 };
 
@@ -129,6 +139,71 @@ ggml_opt_dataset_t ggml_opt_dataset_init(
     return result;
 }
 
+ggml_opt_dataset_t ggml_opt_dataset_init_compact(
+        enum ggml_type type_data,
+        enum ggml_type type_label,
+        int64_t        ne_datapoint,
+        int64_t        ne_label,
+        int64_t        ndata,
+        int64_t        ndata_shard,
+        int64_t        stride,
+        int64_t        idata_split,
+        const int32_t * data_main,
+        const uint8_t * trainable_main,
+        const int32_t * data_val,
+        const uint8_t * trainable_val) {
+    GGML_ASSERT(ne_datapoint >  0);
+    GGML_ASSERT(ne_label     >= 0);
+    GGML_ASSERT(ndata        >  0);
+    GGML_ASSERT(ndata_shard  >  0);
+    GGML_ASSERT(stride       >  0);
+    GGML_ASSERT(data_main    != nullptr);
+    GGML_ASSERT(idata_split  >= 0 && idata_split <= ndata);
+    GGML_ASSERT(type_data    == GGML_TYPE_I32);
+    GGML_ASSERT(type_label   == GGML_TYPE_I32);
+
+    ggml_opt_dataset_t result = new ggml_opt_dataset;
+    result->ndata       = ndata;
+    result->ndata_shard = ndata_shard;
+
+    {
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        result->ctx = ggml_init(params);
+    }
+
+    // keep the tensor metadata (shape/type) so that the generic ggml-opt entry points
+    // still see a well-formed dataset, but do not allocate the (huge) backing buffer
+    result->data = ggml_new_tensor_2d(result->ctx, type_data, ne_datapoint, ndata);
+    result->nbs_data = ggml_nbytes(result->data) * ndata_shard/ndata;
+
+    if (ne_label > 0) {
+        result->labels = ggml_new_tensor_2d(result->ctx, type_label, ne_label, ndata);
+        result->nbs_labels = ggml_nbytes(result->labels) * ndata_shard/ndata;
+    } else {
+        result->labels = nullptr;
+        result->nbs_labels = 0;
+    }
+
+    result->compact     = true;
+    result->stride      = stride;
+    result->idata_split = idata_split;
+    result->stream_main = data_main;
+    result->stream_val  = data_val;
+    result->mask_main   = trainable_main;
+    result->mask_val    = trainable_val;
+
+    const int64_t nshards = ndata/ndata_shard;
+    result->permutation.resize(nshards);
+    for (int64_t i = 0; i < nshards; ++i) {
+        result->permutation[i] = i;
+    }
+    return result;
+}
+
 void ggml_opt_dataset_free(ggml_opt_dataset_t dataset) {
     ggml_backend_buffer_free(dataset->buf);
     ggml_free(dataset->ctx);
@@ -160,6 +235,32 @@ void ggml_opt_dataset_shuffle(ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dat
     std::shuffle(dataset->permutation.begin(), dataset->permutation.begin() + ishard_max, opt_ctx->rng);
 }
 
+// materialise one compact datapoint window from the shared token stream
+static void ggml_opt_dataset_compact_shard(
+        ggml_opt_dataset_t dataset,
+        int64_t            ishard,
+        int32_t          * data_out,
+        int32_t          * labels_out,
+        int64_t            ne_datapoint,
+        int64_t            ne_label) {
+    const bool use_val = dataset->stream_val != nullptr && ishard >= dataset->idata_split;
+    const int32_t * src  = use_val ? dataset->stream_val  : dataset->stream_main;
+    const uint8_t * mask = use_val ? dataset->mask_val    : dataset->mask_main;
+    const int64_t   base = (use_val ? ishard - dataset->idata_split : ishard) * dataset->stride;
+
+    memcpy(data_out, src + base, ne_datapoint*sizeof(int32_t));
+
+    if (labels_out == nullptr) {
+        return;
+    }
+
+    for (int64_t j = 0; j < ne_label; ++j) {
+        const int64_t pos = base + 1 + j;
+        const bool trainable = mask == nullptr || mask[pos] != 0;
+        labels_out[j] = trainable ? src[pos] : (int32_t) -1;
+    }
+}
+
 void ggml_opt_dataset_get_batch(ggml_opt_dataset_t dataset, struct ggml_tensor * data_batch, struct ggml_tensor * labels_batch, int64_t ibatch) {
     GGML_ASSERT(   data_batch && ggml_is_contiguous(data_batch));
     GGML_ASSERT(!labels_batch || ggml_is_contiguous(labels_batch));
@@ -177,6 +278,31 @@ void ggml_opt_dataset_get_batch(ggml_opt_dataset_t dataset, struct ggml_tensor *
     }
 
     GGML_ASSERT((ibatch + 1)*shards_per_batch <= int64_t(dataset->permutation.size()));
+
+    if (dataset->compact) {
+        GGML_ASSERT(dataset->data->type == GGML_TYPE_I32);
+        GGML_ASSERT(dataset->labels == nullptr || dataset->labels->type == GGML_TYPE_I32);
+
+        const int64_t ne_datapoint = dataset->data->ne[0];
+        const int64_t ne_label     = dataset->labels ? dataset->labels->ne[0] : 0;
+
+        std::vector<int32_t> tmp_data(ne_datapoint);
+        std::vector<int32_t> tmp_labels(ne_label);
+
+        for (int64_t ishard_batch = 0; ishard_batch < shards_per_batch; ++ishard_batch) {
+            const int64_t ishard = dataset->permutation[ibatch*shards_per_batch + ishard_batch];
+
+            ggml_opt_dataset_compact_shard(dataset, ishard,
+                    tmp_data.data(), labels_batch ? tmp_labels.data() : nullptr, ne_datapoint, ne_label);
+
+            ggml_backend_tensor_set(data_batch, tmp_data.data(), ishard_batch*dataset->nbs_data, dataset->nbs_data);
+
+            if (labels_batch) {
+                ggml_backend_tensor_set(labels_batch, tmp_labels.data(), ishard_batch*dataset->nbs_labels, dataset->nbs_labels);
+            }
+        }
+        return;
+    }
 
     for (int64_t ishard_batch = 0; ishard_batch < shards_per_batch; ++ishard_batch) {
         const int64_t ishard = dataset->permutation[ibatch*shards_per_batch + ishard_batch];
@@ -200,6 +326,21 @@ void ggml_opt_dataset_get_batch_host(ggml_opt_dataset_t dataset, void * data_bat
     const int64_t shards_per_batch = nb_data_batch / dataset->nbs_data;
 
     GGML_ASSERT((ibatch + 1)*shards_per_batch <= int64_t(dataset->permutation.size()));
+
+    if (dataset->compact) {
+        const int64_t ne_datapoint = dataset->data->ne[0];
+        const int64_t ne_label     = dataset->labels ? dataset->labels->ne[0] : 0;
+
+        for (int64_t ishard_batch = 0; ishard_batch < shards_per_batch; ++ishard_batch) {
+            const int64_t ishard = dataset->permutation[ibatch*shards_per_batch + ishard_batch];
+
+            int32_t * ptr_data_batch   = (int32_t *) ((char *) data_batch   + ishard_batch*dataset->nbs_data);
+            int32_t * ptr_labels_batch = labels_batch ? (int32_t *) ((char *) labels_batch + ishard_batch*dataset->nbs_labels) : nullptr;
+
+            ggml_opt_dataset_compact_shard(dataset, ishard, ptr_data_batch, ptr_labels_batch, ne_datapoint, ne_label);
+        }
+        return;
+    }
 
     for (int64_t ishard_batch = 0; ishard_batch < shards_per_batch; ++ishard_batch) {
         const int64_t ishard = dataset->permutation[ibatch*shards_per_batch + ishard_batch];

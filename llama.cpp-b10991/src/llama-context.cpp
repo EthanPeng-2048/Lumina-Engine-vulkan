@@ -3517,17 +3517,18 @@ void llama_context::opt_epoch_iter(
 
         embd_seq.clear();
 
-        uint32_t n_outputs_all = n_tokens_all;
-
         auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
         if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: could not initialize batch\n", __func__);
             break;
         }
 
-        // reserve output buffer
-        if (output_reserve(n_outputs_all) < n_outputs_all) {
-            LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
+        // reserve output buffer: the training graph is built per micro-batch, so only
+        // n_ubatch logits rows are ever produced. Reserving n_batch here allocated an
+        // n_vocab x n_batch F32 buffer (several GiB for large contexts/vocabs) that the
+        // training path never used.
+        if (output_reserve(n_ubatch) < n_ubatch) {
+            LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_ubatch);
             GGML_ABORT("TODO: handle this error");
         };
 

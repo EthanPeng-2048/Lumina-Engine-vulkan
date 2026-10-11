@@ -22,6 +22,19 @@ static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE/sizeof(float);
 // Work buffer size for im2col operations in CONV2D
 #define GGML_IM2COL_WORK_SIZE (16 * 1024 * 1024)
 
+// Dequantization scratch budget (in floats) for the tiled OUT_PROD path. The
+// quantized weights are dequantized once into a shared slab and reused for all
+// output rows, instead of being re-dequantized once per output row.
+#define GGML_OUT_PROD_TILE_FLOATS (1024 * 1024)
+
+static inline int64_t ggml_cpu_out_prod_tile(int64_t ne0, int64_t ne01) {
+    const int64_t cap = ne0 > 0 ? GGML_OUT_PROD_TILE_FLOATS / ne0 : GGML_OUT_PROD_TILE_FLOATS;
+    if (ne01 < cap) {
+        return ne01 > 0 ? ne01 : 1;
+    }
+    return cap > 0 ? cap : 1;
+}
+
 #ifdef __cplusplus
 extern "C" {
 #endif

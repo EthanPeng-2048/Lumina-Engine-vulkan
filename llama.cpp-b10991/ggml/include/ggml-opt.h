@@ -43,6 +43,35 @@ extern "C" {
             int64_t        ne_label,     // number of elements per label
             int64_t        ndata,        // total number of datapoints/labels
             int64_t        ndata_shard); // number of datapoints/labels per shard (unit at which the dataset is shuffled/copied)
+
+    // Create a dataset backed by one or two compact token streams instead of one full
+    // copy of every datapoint window. Consecutive datapoints overlap by design
+    // (stride < ne_datapoint), so materialising every window wastes a lot of host
+    // memory. Here the streams are kept once and windows are produced on demand.
+    //
+    //   data_main/trainable_main: token stream used for the leading `idata_split` datapoints.
+    //   data_val /trainable_val : optional separate stream for the remaining datapoints.
+    //                             When NULL, the trailing datapoints keep using data_main.
+    //   trainable_*             : per-token mask; may be NULL, in which case all tokens are trainable.
+    //   stride                  : token offset between consecutive datapoint windows.
+    //
+    // The label at window offset j+1 of a datapoint is the corresponding token, or -1
+    // when that position is masked. The caller must keep the streams alive until the
+    // dataset is freed.
+    GGML_API ggml_opt_dataset_t ggml_opt_dataset_init_compact(
+            enum ggml_type type_data,
+            enum ggml_type type_label,
+            int64_t        ne_datapoint,
+            int64_t        ne_label,
+            int64_t        ndata,
+            int64_t        ndata_shard,
+            int64_t        stride,
+            int64_t        idata_split,
+            const int32_t * data_main,
+            const uint8_t * trainable_main,
+            const int32_t * data_val,
+            const uint8_t * trainable_val);
+
     GGML_API void ggml_opt_dataset_free(ggml_opt_dataset_t dataset);
 
     // get underlying tensors that store the data

@@ -142,6 +142,7 @@ static void ggml_backend_meta_device_get_props(ggml_backend_dev_t dev, ggml_back
         props->caps.buffer_from_host_ptr = props->caps.buffer_from_host_ptr && tmp_props.caps.buffer_from_host_ptr;
         props->caps.events               = props->caps.events               && tmp_props.caps.events;
         props->caps.mmap_support         = props->caps.mmap_support         && tmp_props.caps.mmap_support;
+        props->caps.q1_dp4a              = props->caps.q1_dp4a              && tmp_props.caps.q1_dp4a;
     }
 }
 
